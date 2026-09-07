@@ -135,6 +135,16 @@ async def wait_or_stop(stop, seconds):
         pass
 
 
+def poll_interval_seconds():
+    try:
+        seconds = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
+        if seconds < 1:
+            raise ValueError
+    except ValueError:
+        raise ValueError("POLL_INTERVAL_SECONDS: нужно целое число секунд не меньше 1.") from None
+    return seconds
+
+
 def check_unattended_config(config, command):
     required = ["api_id", "api_hash"]
     if command == "run":
@@ -230,6 +240,7 @@ async def main(args):
         check_unattended_config(config, args.command)
     stop = asyncio.Event()
     if args.command == "run":
+        poll_interval = poll_interval_seconds()
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: stop.set())
     api_id = int(config.get("api_id") or input("API ID с my.telegram.org: "))
@@ -271,7 +282,8 @@ async def main(args):
             state = {"route": route, "last_id": latest[0].id if latest else 0}
             write_json(state_path, state)
             print("Начальная точка сохранена. История не пересылается.")
-        print(f"Ожидание новых сообщений {config['club_hashtag']}. Остановка: Ctrl+C.")
+        print(f"Ожидание новых сообщений {config['club_hashtag']}. "
+              f"Интервал опроса: {poll_interval} с. Остановка: Ctrl+C.")
 
         async def send(payload):
             await bot_call(token, "sendMessage", payload)
@@ -286,8 +298,8 @@ async def main(args):
                 await wait_or_stop(stop, error.seconds)
                 continue
             except (OSError, asyncio.TimeoutError):
-                print("Нет связи с источником. Повтор чтения через 15 с.")
-                await wait_or_stop(stop, 15)
+                print(f"Нет связи с источником. Повтор чтения через {poll_interval} с.")
+                await wait_or_stop(stop, poll_interval)
                 continue
             for message in messages:
                 if stop.is_set():
@@ -299,7 +311,7 @@ async def main(args):
                 if sent:
                     print(f"Передано сообщение {message.id}.")
                     await wait_or_stop(stop, 3.2)
-            await wait_or_stop(stop, 15)
+            await wait_or_stop(stop, poll_interval)
         print("Пересылка остановлена; подтверждённые отправки сохранены.")
     finally:
         await client.disconnect()

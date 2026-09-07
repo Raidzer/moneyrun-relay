@@ -10,8 +10,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from telethon.tl.types import Message, MessageReplyHeader, PeerChannel
+from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
-                   read_state, resolve_pending, selected, validate_config, write_json)
+                   poll_interval_seconds, read_state, resolve_pending, selected,
+                   validate_config, write_json)
 
 
 CONFIG = {
@@ -30,6 +32,19 @@ def message(text=TEXT, message_id=101, **fields):
 
 
 class RelayTests(unittest.TestCase):
+    def test_poll_interval_default_and_override(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(poll_interval_seconds(), 15)
+            for value, expected in (("60", 60), ("1", 1), (" 30 ", 30)):
+                with patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": value}):
+                    self.assertEqual(poll_interval_seconds(), expected)
+
+    def test_invalid_poll_interval_is_rejected(self):
+        for value in ("0", "-1", "", "abc", "1.5", "nan", "inf"):
+            with self.subTest(value=value), patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": value}):
+                with self.assertRaisesRegex(ValueError, "POLL_INTERVAL_SECONDS"):
+                    poll_interval_seconds()
+
     def test_real_format_and_no_foreign_clubs(self):
         self.assertTrue(selected(message(), CONFIG))
         self.assertTrue(selected(message(TEXT.lower()), CONFIG))
@@ -179,6 +194,34 @@ class RelayTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_poll_interval_controls_reads_and_retries_but_not_flood_wait(self):
+        for outcome, expected in (([], 60), (OSError("offline"), 60),
+                                  (FloodWaitError(request=None, capture=37), 37)):
+            with self.subTest(outcome=outcome), TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "reader.session").touch()
+                write_json(root / "config.json", {**CONFIG, "api_id": 1234,
+                                                 "api_hash": "dummy", "bot_token": "dummy"})
+                client = AsyncMock()
+                client.is_user_authorized.return_value = True
+                client.is_bot.return_value = False
+                client.get_entity.return_value = SimpleNamespace(noforwards=False)
+                client.get_messages.side_effect = [[message(message_id=100)], outcome]
+
+                async def stop_after_wait(stop, seconds):
+                    stop.set()
+
+                with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
+                     patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": "60"}), \
+                     patch("telethon.TelegramClient", return_value=client), \
+                     patch("relay.signal.signal"), patch("builtins.print"), \
+                     patch("relay.bot_call", return_value={"type": "group"}), \
+                     patch("relay.wait_or_stop", side_effect=stop_after_wait) as wait:
+                    await asyncio.wait_for(main(SimpleNamespace(command="run", non_interactive=True)), 2)
+                wait.assert_awaited_once()
+                self.assertEqual(wait.await_args.args[1], expected)
+                self.assertEqual(read_state(root / "state.json", CONFIG)["last_id"], 100)
+
     async def test_sigterm_finishes_in_flight_send_and_disconnects(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
