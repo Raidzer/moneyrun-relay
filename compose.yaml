@@ -1,0 +1,32 @@
+services:
+  relay:
+    image: ${RELAY_IMAGE:-ghcr.io/raidzer/moneyrun-relay:latest}
+    platform: linux/amd64
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ${RELAY_DIR:-/share/Container/moneyrun-relay}/config.json
+        target: /app/config.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RELAY_DIR:-/share/Container/moneyrun-relay}/Local
+        target: /app/.local
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:size=16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

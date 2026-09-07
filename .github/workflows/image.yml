@@ -1,0 +1,62 @@
+name: Проверка и публикация образа
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Собрать образ для QNAP
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$image:sha-$GITHUB_SHA" .
+
+      - name: Проверить программу внутри образа без доступа к сети
+        shell: bash
+        run: |
+          docker run --rm --network none --read-only --tmpfs /tmp \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/test_relay.py,target=/app/test_relay.py,readonly" \
+            --entrypoint python "$IMAGE:sha-$GITHUB_SHA" \
+            -m unittest -v test_relay.py
+
+      - name: Опубликовать проверенный образ в GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+          echo "Образ: $IMAGE:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "Точная версия: $IMAGE:sha-$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Завершить вход в GHCR
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: docker logout ghcr.io
