@@ -12,6 +12,7 @@ import signal
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -137,6 +138,53 @@ async def wait_or_stop(stop, seconds):
         pass
 
 
+async def test_recent(client, source, config, count=3, sending=False):
+    if type(count) is not int or not 1 <= count <= 3:
+        raise ValueError("Для теста допустимо от 1 до 3 сообщений.")
+    if getattr(source, "noforwards", False):
+        raise RuntimeError("В источнике включена защита содержимого; тест остановлен.")
+    messages = []
+    # Не читаем всю историю большого форума ради разовой проверки.
+    async for message in client.iter_messages(source, limit=1000):
+        if selected(message, config):
+            messages.append(message)
+            if len(messages) == count:
+                break
+    messages.reverse()
+    print(f"Найдено сообщений клуба: {len(messages)} из запрошенных {count}. "
+          "Поиск ограничен последними 1000 сообщениями источника.")
+    print(f"Получатель: {config['destination_chat_id']}, "
+          f"тема: {config.get('destination_topic_id')}.")
+    for message in messages:
+        if getattr(message, "noforwards", False):
+            raise RuntimeError("У сообщения включена защита содержимого; тест остановлен.")
+        print(f"\nСообщение {message.id}, топик {topic_id(message)}:\n{message.raw_text}")
+    if not sending or not messages:
+        print("Ничего не отправлено. Для тестовой отправки добавь --send.")
+        return
+    print("Тест повторно отправляет выбранные тексты, даже если они уже были доставлены.")
+    token = config.get("bot_token") or getpass("Токен бота-получателя (ввод скрыт): ")
+    target = await bot_call(token, "getChat", {"chat_id": config["destination_chat_id"]})
+    if target.get("type") not in ("group", "supergroup"):
+        raise ValueError("Получателем должна быть группа клуба.")
+    receipt = LOCAL / f"test-send-{uuid4().hex}.json"
+    state = {"route": {key: config.get(key) for key in ROUTE_KEYS},
+             "last_id": 0, "pending_id": None,
+             "message_ids": [message.id for message in messages]}
+    print(f"Результат теста: {receipt.name}. Рабочий state.json не меняется.")
+
+    async def send(payload):
+        await bot_call(token, "sendMessage", payload)
+
+    for index, message in enumerate(messages):
+        await process_message(message, config, state,
+                              lambda data: write_json(receipt, data), send)
+        print(f"Тест: передано сообщение {message.id}.")
+        if index < len(messages) - 1:
+            await asyncio.sleep(3.2)
+    print(f"Тест завершён: отправлено {len(messages)} сообщений.")
+
+
 def poll_interval_seconds():
     try:
         seconds = int(os.environ.get("POLL_INTERVAL_SECONDS", "15"))
@@ -149,7 +197,7 @@ def poll_interval_seconds():
 
 def check_unattended_config(config, command):
     required = ["api_id", "api_hash"]
-    if command == "run":
+    if command in ("run", "test"):
         required.append("bot_token")
     missing = [key for key in required if not config.get(key)]
     if missing:
@@ -228,7 +276,7 @@ async def main(args):
         raise ValueError("Сначала скопируй config.example.json в config.json.")
     config = json.loads(path.read_text(encoding="utf-8-sig"))
     if args.command != "chats":
-        validate_config(config, sending=args.command in ("run", "resolve"))
+        validate_config(config, sending=args.command in ("run", "resolve", "test"))
     route = {key: config.get(key) for key in ROUTE_KEYS}
     state_path = LOCAL / "state.json"
     if args.command == "resolve":
@@ -263,6 +311,9 @@ async def main(args):
                     print(f"{dialog.id}\t{dialog.name}")
             return
         source = await client.get_entity(config["source_chat_id"])
+        if args.command == "test":
+            await test_recent(client, source, config, args.count, args.send)
+            return
         if args.command == "preview":
             messages = await client.get_messages(source, limit=50)
             count = 0
@@ -327,8 +378,12 @@ if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")
     LOG.setLevel(logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("chats", "preview", "run", "resolve"),
-                        help="chats — ID групп; preview — просмотр; run — пересылка; resolve — проверка отправки")
+    parser.add_argument("command", choices=("chats", "preview", "run", "resolve", "test"),
+                        help="chats — ID групп; preview — просмотр; run — пересылка; "
+                             "resolve — проверка отправки; test — последние сообщения клуба")
+    parser.add_argument("--count", type=int, choices=(1, 2, 3), default=3,
+                        help="Число сообщений для test (по умолчанию 3)")
+    parser.add_argument("--send", action="store_true", help="Отправить сообщения в режиме test")
     parser.add_argument("--non-interactive", action="store_true", help="Без запросов ввода, для Docker")
     parser.add_argument("--message-id", type=int, help="ID неподтверждённой отправки для resolve")
     parser.add_argument("--result", choices=("sent", "retry"), help="Результат ручной проверки для resolve")

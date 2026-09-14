@@ -13,7 +13,7 @@ from telethon.tl.types import Message, MessageReplyHeader, PeerChannel
 from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
                    poll_interval_seconds, read_state, resolve_pending, selected,
-                   validate_config, write_json)
+                   single_instance, validate_config, write_json)
 
 
 CONFIG = {
@@ -32,6 +32,13 @@ def message(text=TEXT, message_id=101, **fields):
 
 
 class RelayTests(unittest.TestCase):
+    def test_second_process_cannot_share_reader_folder(self):
+        with TemporaryDirectory() as folder, patch("relay.LOCAL", Path(folder)):
+            with single_instance():
+                with self.assertRaisesRegex(RuntimeError, "Другая копия"):
+                    with single_instance():
+                        self.fail("Reader lock was bypassed")
+
     def test_poll_interval_default_and_override(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(poll_interval_seconds(), 15)
@@ -194,6 +201,73 @@ class RelayTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recent_preview_send_failure_and_protection_keep_live_state(self):
+        for mode in ("preview", "send", "failure", "protected", "empty"):
+            with self.subTest(mode=mode), TemporaryDirectory() as folder:
+                root = Path(folder)
+                config = {**CONFIG, "source_topic_id": 50, "destination_topic_id": 73}
+                write_json(root / "config.json", {**config, "api_id": 1234,
+                                                 "api_hash": "dummy", "bot_token": "dummy"})
+                (root / "reader.session").touch()
+                write_json(root / "state.json", {"route": config, "last_id": 999, "pending_id": None})
+                original = (root / "state.json").read_bytes()
+                reply = MessageReplyHeader(reply_to_msg_id=50, forum_topic=True)
+                history = [message(message_id=110),  # Другой топик.
+                           message("#OtherClub\ntext", message_id=109, reply_to=reply)]
+                if mode != "empty":
+                    history += [message(message_id=i, reply_to=reply,
+                                        noforwards=(mode == "protected" and i == 103))
+                                for i in (104, 103, 102, 101)]
+
+                async def iterate(*args, **kwargs):
+                    self.assertEqual(kwargs, {"limit": 1000})
+                    for item in history:
+                        yield item
+
+                client = AsyncMock()
+                client.is_user_authorized.return_value = True
+                client.is_bot.return_value = False
+                client.get_entity.return_value = SimpleNamespace(noforwards=False)
+                client.iter_messages = iterate
+                payloads = []
+
+                async def api(token, method, payload):
+                    if method == "sendMessage":
+                        payloads.append(payload)
+                        if mode == "failure":
+                            raise RuntimeError("uncertain delivery")
+                    return {"type": "supergroup"}
+
+                with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
+                     patch("telethon.TelegramClient", return_value=client), \
+                     patch("relay.bot_call", side_effect=api) as bot, \
+                     patch("relay.asyncio.sleep", new_callable=AsyncMock), patch("builtins.print"):
+                    task = main(SimpleNamespace(command="test", non_interactive=True,
+                                                count=3, send=(mode != "preview")))
+                    if mode in ("failure", "protected"):
+                        with self.assertRaises(RuntimeError):
+                            await task
+                    else:
+                        await task
+                self.assertEqual((root / "state.json").read_bytes(), original)
+                client.disconnect.assert_awaited_once()
+                receipts = list(root.glob("test-send-*.json"))
+                if mode in ("preview", "protected", "empty"):
+                    bot.assert_not_awaited()
+                    self.assertEqual(receipts, [])
+                else:
+                    self.assertEqual(len(receipts), 1)
+                    receipt = read_state(receipts[0], config, allow_pending=True)
+                    self.assertEqual(receipt["message_ids"], [102, 103, 104])
+                    self.assertEqual(receipt["pending_id"], 102 if mode == "failure" else None)
+                    self.assertEqual(receipt["last_id"], 0 if mode == "failure" else 104)
+                    self.assertEqual(len(payloads), 1 if mode == "failure" else 3)
+                    for payload, msg_id in zip(payloads, (102, 103, 104)):
+                        self.assertEqual(payload["chat_id"], config["destination_chat_id"])
+                        self.assertEqual(payload["message_thread_id"], 73)
+                        self.assertEqual(payload["text"], TEXT)
+                        self.assertTrue(payload["reply_markup"]["inline_keyboard"][0][0]["url"].endswith(f"/{msg_id}"))
+
     async def test_poll_interval_controls_reads_and_retries_but_not_flood_wait(self):
         for outcome, expected in (([], 60), (OSError("offline"), 60),
                                   (FloodWaitError(request=None, capture=37), 37)):
