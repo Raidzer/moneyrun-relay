@@ -214,6 +214,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
                      patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": "60"}), \
                      patch("telethon.TelegramClient", return_value=client), \
+                     patch("relay.LOG") as log, \
                      patch("relay.signal.signal"), patch("builtins.print"), \
                      patch("relay.bot_call", return_value={"type": "group"}), \
                      patch("relay.wait_or_stop", side_effect=stop_after_wait) as wait:
@@ -221,6 +222,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 wait.assert_awaited_once()
                 self.assertEqual(wait.await_args.args[1], expected)
                 self.assertEqual(read_state(root / "state.json", CONFIG)["last_id"], 100)
+                if isinstance(outcome, list):
+                    log.info.assert_called_once()
+                    self.assertEqual(log.info.call_args.args[1], 0)
+                else:
+                    log.info.assert_not_called()
 
     async def test_sigterm_finishes_in_flight_send_and_disconnects(self):
         with TemporaryDirectory() as folder:

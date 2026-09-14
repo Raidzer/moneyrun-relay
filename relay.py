@@ -5,6 +5,7 @@ import asyncio
 from contextlib import contextmanager
 from getpass import getpass
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -14,6 +15,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
+LOG = logging.getLogger("moneyrun_relay")
 ROUTE_KEYS = (
     "source_chat_id", "source_topic_id", "destination_chat_id",
     "destination_topic_id", "club_hashtag",
@@ -298,9 +300,11 @@ async def main(args):
                 await wait_or_stop(stop, error.seconds)
                 continue
             except (OSError, asyncio.TimeoutError):
-                print(f"Нет связи с источником. Повтор чтения через {poll_interval} с.")
+                LOG.warning("Нет связи с источником. Повтор чтения через %s с.", poll_interval)
                 await wait_or_stop(stop, poll_interval)
                 continue
+            LOG.info("Источник ответил: получено новых сообщений — %s (до отбора по клубу).",
+                     len(messages))
             for message in messages:
                 if stop.is_set():
                     break
@@ -320,6 +324,8 @@ async def main(args):
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
+    logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")
+    LOG.setLevel(logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("chats", "preview", "run", "resolve"),
                         help="chats — ID групп; preview — просмотр; run — пересылка; resolve — проверка отправки")
