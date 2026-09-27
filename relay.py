@@ -366,7 +366,8 @@ async def main(args):
                 if sent:
                     print(f"Передано сообщение {message.id}.")
                     await wait_or_stop(stop, 3.2)
-            await wait_or_stop(stop, poll_interval)
+            if len(messages) < 100:
+                await wait_or_stop(stop, poll_interval)
         print("Пересылка остановлена; подтверждённые отправки сохранены.")
     finally:
         await client.disconnect()

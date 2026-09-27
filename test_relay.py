@@ -201,6 +201,53 @@ class RelayTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backlog_drains_full_batches_before_poll_wait(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "reader.session").touch()
+            write_json(root / "config.json", {**CONFIG, "api_id": 1234,
+                                             "api_hash": "dummy", "bot_token": "dummy"})
+            write_json(root / "state.json", {"route": CONFIG, "last_id": 100})
+            history = [message(TEXT if i in (201, 299, 301) else "#OtherClub\ntext",
+                               message_id=i) for i in range(101, 303)]
+            events = []
+
+            async def read(source, **kwargs):
+                self.assertEqual(kwargs["limit"], 100)
+                self.assertTrue(kwargs["reverse"])
+                events.append(("read", kwargs["min_id"]))
+                return [item for item in history if item.id > kwargs["min_id"]][:100]
+
+            async def api(token, method, payload):
+                if method == "sendMessage":
+                    url = payload["reply_markup"]["inline_keyboard"][0][0]["url"]
+                    events.append(("send", int(url.rsplit("/", 1)[1])))
+                return {"type": "group"}
+
+            async def wait(stop, seconds):
+                events.append(("wait", seconds))
+                if seconds == 60:
+                    stop.set()
+
+            client = AsyncMock()
+            client.is_user_authorized.return_value = True
+            client.is_bot.return_value = False
+            client.get_entity.return_value = SimpleNamespace(noforwards=False)
+            client.get_messages.side_effect = read
+            with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
+                 patch.dict("os.environ", {"POLL_INTERVAL_SECONDS": "60"}), \
+                 patch("telethon.TelegramClient", return_value=client), \
+                 patch("relay.signal.signal"), patch("builtins.print"), \
+                 patch("relay.bot_call", side_effect=api), \
+                 patch("relay.wait_or_stop", side_effect=wait):
+                await asyncio.wait_for(main(SimpleNamespace(command="run", non_interactive=True)), 2)
+            self.assertEqual(events, [("read", 100), ("read", 200),
+                                      ("send", 201), ("wait", 3.2),
+                                      ("send", 299), ("wait", 3.2), ("read", 300),
+                                      ("send", 301), ("wait", 3.2), ("wait", 60)])
+            self.assertEqual(read_state(root / "state.json", CONFIG)["last_id"], 302)
+            client.disconnect.assert_awaited_once()
+
     async def test_recent_preview_send_failure_and_protection_keep_live_state(self):
         for mode in ("preview", "send", "failure", "protected", "empty"):
             with self.subTest(mode=mode), TemporaryDirectory() as folder:
