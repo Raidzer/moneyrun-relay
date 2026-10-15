@@ -43,6 +43,7 @@ jobs:
             --mount "type=bind,source=$GITHUB_WORKSPACE/test_relay.py,target=/app/test_relay.py,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/test_tracking.py,target=/app/test_tracking.py,readonly" \
             --mount "type=bind,source=$GITHUB_WORKSPACE/test_commands.py,target=/app/test_commands.py,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/test_jokes.py,target=/app/test_jokes.py,readonly" \
             --entrypoint python "$IMAGE:sha-$GITHUB_SHA" \
             -m unittest -v
 

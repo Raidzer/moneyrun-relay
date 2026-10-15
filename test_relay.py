@@ -278,6 +278,12 @@ class RelayTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.joke_choice = AsyncMock(return_value=None)
+        joke_patch = patch("relay.JokeSource.choose", self.joke_choice)
+        joke_patch.start()
+        self.addCleanup(joke_patch.stop)
+
     async def test_rate_limit_after_first_summary_part_does_not_repeat_delivered_tickets(self):
         now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
         with TemporaryDirectory() as folder:
@@ -778,6 +784,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(payload["message_thread_id"], 73)
                         self.assertEqual(payload["text"], TEXT)
                         self.assertTrue(payload["reply_markup"]["inline_keyboard"][0][0]["url"].endswith(f"/{msg_id}"))
+        self.joke_choice.assert_not_awaited()
 
     async def test_poll_interval_controls_reads_and_retries_but_not_flood_wait(self):
         for outcome, expected in (([], 60), (OSError("offline"), 60),
@@ -870,7 +877,14 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
     now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
     settings = {"interval": 14400, "start": 1380, "end": 540}
 
+    def setUp(self):
+        self.joke_choice = AsyncMock(return_value=None)
+        joke_patch = patch("relay.JokeSource.choose", self.joke_choice)
+        joke_patch.start()
+        self.addCleanup(joke_patch.stop)
+
     async def test_first_other_reply_reacts_once_to_delivered_card_without_forwarding_replies(self):
+        self.joke_choice.return_value = "Тестовый анекдот."
         config = {**CONFIG, "destination_topic_id": 73}
         with TemporaryDirectory() as folder:
             store = TicketStore(Path(folder) / "tickets.sqlite3", config, initial_id=100, now=self.now)
@@ -916,8 +930,11 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.wait_for(run_tracking(client, object(), config, store, stop, 60,
                                                         self.settings, "dummy", BOT), 2)
                 self.assertEqual([method for method, _ in calls], ["sendMessage", "setMessageReaction"])
-                self.assertEqual(calls[0][1]["text"], CREATED)
+                self.assertEqual(calls[0][1]["text"], CREATED + "\n\n────────────\n😄 Анекдот\n"
+                                 "Тестовый анекдот.\n\nИсточник: https://www.anekdot.ru/")
                 self.assertEqual(calls[0][1]["message_thread_id"], 73)
+                self.assertTrue(calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["url"].endswith("/102"))
+                self.joke_choice.assert_awaited_once()
                 self.assertEqual(store.state["last_id"], 106)
                 self.assertEqual(store.pending_tickets(), [])
                 self.assertEqual(store.pending_reactions(self.now + 86400), [])

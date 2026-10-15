@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from tracking import TicketStore, parse_ticket_event
 from commands import command_loop
+from jokes import JokeSource, append_joke
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -318,6 +319,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
 
     send_lock, acknowledgements = asyncio.Lock(), asyncio.Queue(maxsize=100)
     reaction_ready = asyncio.Event()
+    joke_source = JokeSource()
     last_send = 0.0
 
     async def send(payload, *, reminder=False, regular=False, before_send=None, reaction=False):
@@ -421,7 +423,9 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                     raise RuntimeError("У сообщения включена защита содержимого; обработка остановлена.")
                 created_at = message.date.timestamp() if event else 0
                 if store.process(message.id, event, created_at):
-                    delivery = await send(message_payload(message, config))
+                    payload = message_payload(message, config)
+                    payload["text"] = append_joke(payload["text"], await joke_source.choose())
+                    delivery = await send(payload)
                     target_id = delivery.get("message_id") if isinstance(delivery, dict) else None
                     if type(target_id) is not int or target_id <= 0:
                         raise RuntimeError("Telegram не подтвердил ID доставленной карточки; "

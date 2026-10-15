@@ -5,7 +5,7 @@ WORKDIR /app
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY relay.py tracking.py commands.py ./
+COPY relay.py tracking.py commands.py jokes.py ./
 RUN mkdir /app/.local
 
 ENTRYPOINT ["python", "relay.py"]
