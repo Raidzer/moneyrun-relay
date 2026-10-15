@@ -8,6 +8,9 @@ services:
     stop_grace_period: 60s
     environment:
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-15}
+      REMINDER_INTERVAL_HOURS: ${REMINDER_INTERVAL_HOURS:-4}
+      QUIET_HOURS_START: ${QUIET_HOURS_START:-23:00}
+      QUIET_HOURS_END: ${QUIET_HOURS_END:-09:00}
     read_only: true
     cap_drop:
       - ALL

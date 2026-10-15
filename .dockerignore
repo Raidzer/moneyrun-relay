@@ -3,3 +3,5 @@
 !.dockerignore
 !requirements.txt
 !relay.py
+!tracking.py
+!commands.py

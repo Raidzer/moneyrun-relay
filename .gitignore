@@ -4,5 +4,6 @@ config.json*
 .local/
 Local/
 *.session*
+*.sqlite3*
 .env
 .env.*

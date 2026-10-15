@@ -3,16 +3,22 @@
 import argparse
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from getpass import getpass
 import json
 import logging
 import os
 from pathlib import Path
+import re
 import signal
 import sys
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from uuid import uuid4
+
+from tracking import TicketStore, parse_ticket_event
+from commands import command_loop
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -195,6 +201,61 @@ def poll_interval_seconds():
     return seconds
 
 
+def reminder_settings():
+    try:
+        hours = int(os.environ.get("REMINDER_INTERVAL_HOURS", "4"))
+        if hours < 1:
+            raise ValueError
+    except ValueError:
+        raise ValueError("REMINDER_INTERVAL_HOURS: нужно целое число часов не меньше 1.") from None
+    values = []
+    for key, default in (("QUIET_HOURS_START", "23:00"), ("QUIET_HOURS_END", "09:00")):
+        value = os.environ.get(key, default)
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ValueError(f"{key}: нужно время в формате ЧЧ:ММ от 00:00 до 23:59.")
+        hour, minute = map(int, value.split(":"))
+        values.append(hour * 60 + minute)
+    if values[0] == values[1]:
+        raise ValueError("Начало и конец тихих часов должны различаться.")
+    return {"interval": hours * 3600, "start": values[0], "end": values[1]}
+
+
+def quiet_hours(now, settings):
+    local = datetime.fromtimestamp(now, timezone(timedelta(hours=3)))
+    minute = local.hour * 60 + local.minute
+    start, end = settings["start"], settings["end"]
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def reminder_payloads(plan, config, now):
+    title = ("Ожидают первого ответа" if plan["regular_due"]
+             else "Срочно: обращения ожидают ответа более 20 часов")
+    heading = title + ":\n\n"
+    chunks, text = [], heading
+    for ticket in plan["tickets"]:
+        hours = max(0, int((now - ticket["created_at"]) / 3600))
+        minutes = max(0, int((now - ticket["created_at"]) / 60)) % 60
+        urgent = "СРОЧНО · " if now - ticket["created_at"] > 20 * 3600 else ""
+        source = str(config["source_chat_id"])
+        link = (f"https://t.me/c/{source[4:]}/{ticket['source_message_id']}\n"
+                if config["source_chat_id"] < -1000000000000 else "")
+        entry = (f"{urgent}#{ticket['ticket_id']} · {ticket['author'][:100]}\n"
+                 f"{ticket['title'][:200]}\nОжидание: {hours} ч {minutes} мин\n{link}\n")
+        if len((text + entry).encode("utf-16-le")) // 2 > 3900:
+            chunks.append(text.rstrip())
+            text = heading
+        text += entry
+    if text != heading:
+        chunks.append(text.rstrip())
+    return [{"chat_id": config["destination_chat_id"], "text": chunk,
+             "link_preview_options": {"is_disabled": True},
+             **({"message_thread_id": config["destination_topic_id"]}
+                if config.get("destination_topic_id") is not None else {})}
+            for chunk in chunks]
+
+
 def check_unattended_config(config, command):
     required = ["api_id", "api_hash"]
     if command in ("run", "test"):
@@ -227,17 +288,156 @@ def bot_request(token, method, payload):
                            "Перед повторным запуском проверь группу: сообщение могло дойти.") from None
 
 
-async def bot_call(token, method, payload):
+class BotRateLimitError(RuntimeError):
+    def __init__(self, seconds):
+        super().__init__("Telegram запросил паузу отправки.")
+        self.seconds = seconds
+
+
+async def bot_call(token, method, payload, *, allowed=None, wait_on_rate_limit=True):
     while True:
+        if allowed is not None and not allowed():
+            return None
         result = await asyncio.to_thread(bot_request, token, method, payload)
         if result.get("ok"):
             return result["result"]
         if result.get("error_code") == 429:
-            await asyncio.sleep(max(1, result.get("parameters", {}).get("retry_after", 15)))
+            seconds = max(1, result.get("parameters", {}).get("retry_after", 15))
+            if not wait_on_rate_limit:
+                raise BotRateLimitError(seconds)
+            await asyncio.sleep(seconds)
             continue
         code = result.get("error_code", "unknown")
         raise RuntimeError(f"Telegram Bot API: ошибка {code}. "
                            "Проверь токен, ID группы/топика и право бота отправлять сообщения.")
+
+
+async def run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot):
+    from telethon.errors import FloodWaitError
+
+    send_lock, acknowledgements = asyncio.Lock(), asyncio.Queue(maxsize=100)
+    last_send = 0.0
+
+    async def send(payload, *, reminder=False, regular=False, before_send=None):
+        nonlocal last_send
+        async with send_lock:
+            while store.state["send_retry_at"] > time.time():
+                if reminder:
+                    return False
+                await asyncio.sleep(store.state["send_retry_at"] - time.time())
+            await asyncio.sleep(max(0, 3.2 - (time.monotonic() - last_send)))
+            allowed = lambda: (not stop.is_set() and not store.state["paused"]
+                               and (not regular or not quiet_hours(time.time(), settings)))
+            if reminder and not allowed():
+                return False
+            if before_send is not None:
+                before_send()
+            try:
+                if reminder:
+                    result = await bot_call(token, "sendMessage", payload, allowed=allowed,
+                                            wait_on_rate_limit=False)
+                else:
+                    result = await bot_call(token, "sendMessage", payload)
+                return result is not None
+            finally:
+                last_send = time.monotonic()
+
+    async def enqueue_ack(payload):
+        try:
+            acknowledgements.put_nowait(payload)
+        except asyncio.QueueFull:
+            LOG.warning("Очередь подтверждений команд заполнена; команда уже сохранена.")
+
+    async def acknowledge():
+        while True:
+            payload = await acknowledgements.get()
+            try:
+                await send(payload)
+            except RuntimeError:
+                LOG.warning("Не удалось подтвердить команду в Telegram; состояние сохранено.")
+            finally:
+                acknowledgements.task_done()
+
+    async def read_and_remind():
+        while not stop.is_set():
+            try:
+                messages = await client.get_messages(
+                    source, min_id=store.state["last_id"], reverse=True, limit=100)
+            except FloodWaitError as error:
+                print(f"Telegram запросил паузу {error.seconds} с.")
+                await wait_or_stop(stop, error.seconds)
+                continue
+            except (OSError, asyncio.TimeoutError):
+                LOG.warning("Нет связи с источником. Повтор чтения через %s с.", poll_interval)
+                await wait_or_stop(stop, poll_interval)
+                continue
+            LOG.info("Источник ответил: получено новых сообщений — %s (до отбора по клубу).",
+                     len(messages))
+            for message in messages:
+                if stop.is_set():
+                    break
+                matches = selected(message, config)
+                event = parse_ticket_event(message.raw_text or "") if matches else None
+                if matches and event is None:
+                    LOG.warning("Не распознан заголовок уведомления %s; состояние тикетов не изменено.",
+                                message.id)
+                if event and getattr(message, "noforwards", False):
+                    raise RuntimeError("У сообщения включена защита содержимого; обработка остановлена.")
+                created_at = message.date.timestamp() if event else 0
+                if store.process(message.id, event, created_at):
+                    await send(message_payload(message, config))
+                    store.confirm_sent(message.id)
+                    print(f"Передано сообщение {message.id}.")
+            if len(messages) == 100:
+                continue
+            if stop.is_set():
+                break
+            now = time.time()
+            previous_regular_at = store.state["last_regular_at"]
+            plan = store.reminder_plan(now, settings["interval"], quiet_hours(now, settings))
+            payloads = reminder_payloads(plan, config, now)
+            if plan["regular_due"] and not payloads:
+                store.mark_reminder_attempt(plan, now)
+            for index, payload in enumerate(payloads):
+                try:
+                    recorded = (lambda: store.mark_reminder_attempt(plan, time.time())) if index == 0 else None
+                    if not await send(payload, reminder=True, regular=plan["regular_due"],
+                                      before_send=recorded):
+                        break
+                    LOG.info("Отправлена часть сводки %s/%s.", index + 1, len(payloads))
+                except BotRateLimitError as error:
+                    # После частичной доставки не откатывать сроки уже отправленных частей.
+                    rejected = plan if index == 0 else {"regular_due": False, "tickets": [], "urgent_ids": []}
+                    store.defer_reminder(rejected, time.time() + error.seconds, previous_regular_at)
+                    LOG.warning("Telegram отложил рассылку на %s с.; чтение источника продолжается.",
+                                error.seconds)
+                    break
+                except RuntimeError:
+                    LOG.warning("Не получено подтверждение рассылки; следующая попытка по расписанию.")
+                    break
+            await wait_or_stop(stop, poll_interval)
+        print("Пересылка остановлена; подтверждённые отправки и тикеты сохранены.")
+
+    reader = asyncio.create_task(read_and_remind())
+    tasks = [reader, asyncio.create_task(command_loop(token, bot["username"], config, store,
+                                                      stop, bot_call, enqueue_ack)),
+             asyncio.create_task(acknowledge())]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+        if stop.is_set():
+            if store.state["pending_id"] is None and not reader.done():
+                reader.cancel()  # Ожидание чтения можно прервать без изменения позиции.
+                await asyncio.gather(reader, return_exceptions=True)
+            else:
+                await reader  # Сохранить результат начатой отправки нового тикета.
+        elif reader not in done:
+            raise RuntimeError("Обработка команд неожиданно остановилась.")
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @contextmanager
@@ -269,7 +469,6 @@ def single_instance():
 
 async def main(args):
     from telethon import TelegramClient
-    from telethon.errors import FloodWaitError
 
     path = ROOT / "config.json"
     if not path.exists():
@@ -279,24 +478,42 @@ async def main(args):
         validate_config(config, sending=args.command in ("run", "resolve", "test"))
     route = {key: config.get(key) for key in ROUTE_KEYS}
     state_path = LOCAL / "state.json"
+    store_path = LOCAL / "tickets.sqlite3"
+    marker = LOCAL / "tracking.initialized"
+    if args.command in ("run", "resolve") and marker.exists() and not store_path.exists():
+        raise ValueError("Пропала база tickets.sqlite3. Восстанови папку Local из резервной копии; "
+                         "автоматический запуск с нуля отменён.")
     if args.command == "resolve":
         if args.message_id is None or args.result is None:
             raise ValueError("Для resolve нужны --message-id и --result sent|retry.")
-        resolve_pending(state_path, route, args.message_id, args.result)
+        if store_path.exists():
+            with_store = TicketStore(store_path, route)
+            try:
+                with_store.resolve(args.message_id, args.result)
+            finally:
+                with_store.close()
+        else:
+            resolve_pending(state_path, route, args.message_id, args.result)
         print("Результат проверки сохранён. Можно запускать пересылку.")
         return
-    state = read_state(state_path, route) if args.command == "run" else None
+    if args.command == "run" and not store_path.exists():
+        read_state(state_path, route)  # Сначала разрешить старую неподтверждённую отправку.
     if args.non_interactive:
         check_unattended_config(config, args.command)
     stop = asyncio.Event()
     if args.command == "run":
         poll_interval = poll_interval_seconds()
+        settings = reminder_settings()
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: stop.set())
     api_id = int(config.get("api_id") or input("API ID с my.telegram.org: "))
     api_hash = config.get("api_hash") or getpass("API hash (ввод скрыт): ")
     client = TelegramClient(str(LOCAL / "reader"), api_id, api_hash, receive_updates=False)
+    store = None
     try:
+        if args.command == "run" and store_path.exists():
+            store = TicketStore(store_path, route)
+            store.ensure_no_pending()
         if args.non_interactive:
             await client.connect()
             if not await client.is_user_authorized():
@@ -326,51 +543,37 @@ async def main(args):
         if getattr(source, "noforwards", False):
             raise RuntimeError("В источнике включена защита содержимого; пересылка остановлена.")
         token = config.get("bot_token") or getpass("Токен бота-получателя (ввод скрыт): ")
-        await bot_call(token, "getMe", {})
+        bot = await bot_call(token, "getMe", {})
         target = await bot_call(token, "getChat", {"chat_id": config["destination_chat_id"]})
         if target.get("type") not in ("group", "supergroup"):
             raise ValueError("Получателем должна быть группа клуба.")
-        if state is None:
+        webhook = await bot_call(token, "getWebhookInfo", {})
+        if webhook.get("url"):
+            raise ValueError("У бота настроен webhook. Для команд нужен getUpdates; "
+                             "отключи прежний webhook перед запуском.")
+        member = await bot_call(token, "getChatMember",
+                                {"chat_id": config["destination_chat_id"], "user_id": bot["id"]})
+        if member.get("status") not in ("creator", "administrator"):
+            raise ValueError("Для проверки команд бот должен быть администратором группы-получателя.")
+        if store is None:
             latest = await client.get_messages(source, limit=1)
-            state = {"route": route, "last_id": latest[0].id if latest else 0}
-            write_json(state_path, state)
-            print("Начальная точка сохранена. История не пересылается.")
-        print(f"Ожидание новых сообщений {config['club_hashtag']}. "
+            store = TicketStore(store_path, route, initial_id=latest[0].id if latest else 0,
+                                now=time.time())
+            print("Учёт тикетов начат с нуля. Старая история не читается и не пересылается.")
+        marker.write_text("1\n", encoding="ascii")
+        print(f"Ожидание новых тикетов {config['club_hashtag']}. "
               f"Интервал опроса: {poll_interval} с. Остановка: Ctrl+C.")
-
-        async def send(payload):
-            await bot_call(token, "sendMessage", payload)
-
-        while not stop.is_set():
-            try:
-                messages = await client.get_messages(
-                    source, min_id=state["last_id"], reverse=True, limit=100,
-                )
-            except FloodWaitError as error:
-                print(f"Telegram запросил паузу {error.seconds} с.")
-                await wait_or_stop(stop, error.seconds)
-                continue
-            except (OSError, asyncio.TimeoutError):
-                LOG.warning("Нет связи с источником. Повтор чтения через %s с.", poll_interval)
-                await wait_or_stop(stop, poll_interval)
-                continue
-            LOG.info("Источник ответил: получено новых сообщений — %s (до отбора по клубу).",
-                     len(messages))
-            for message in messages:
-                if stop.is_set():
-                    break
-                sent = await process_message(
-                    message, config, state,
-                    lambda data: write_json(state_path, data), send,
-                )
-                if sent:
-                    print(f"Передано сообщение {message.id}.")
-                    await wait_or_stop(stop, 3.2)
-            if len(messages) < 100:
-                await wait_or_stop(stop, poll_interval)
-        print("Пересылка остановлена; подтверждённые отправки сохранены.")
+        print(f"Обычная сводка: каждые {settings['interval'] // 3600} ч. "
+              f"Тихие часы: {settings['start'] // 60:02}:{settings['start'] % 60:02}–"
+              f"{settings['end'] // 60:02}:{settings['end'] % 60:02} по Москве. "
+              f"Ручная пауза: {'включена' if store.state['paused'] else 'выключена'}.")
+        await run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot)
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        finally:
+            if store is not None:
+                store.close()
 
 
 if __name__ == "__main__":
