@@ -1,12 +1,14 @@
 """Проверки учёта и расписания на временных SQLite-файлах."""
 
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from tracking import (TicketStore, URGENT_AFTER_SECONDS, URGENT_INTERVAL_SECONDS,
+from tracking import (SCHEMA_VERSION, TicketStore, URGENT_AFTER_SECONDS, URGENT_INTERVAL_SECONDS,
                       normalize_author, parse_ticket_event)
 
 
@@ -68,9 +70,9 @@ class StoreFixture(unittest.TestCase):
         self.addCleanup(store.close)
         return store
 
-    def create_and_confirm(self, message_id=101, ticket_id=42, when=0, **kwargs):
+    def create_and_confirm(self, message_id=101, ticket_id=42, when=0, destination_message_id=None, **kwargs):
         self.assertTrue(self.store.process(message_id, created(ticket_id, **kwargs), when))
-        self.store.confirm_sent(message_id)
+        self.store.confirm_sent(message_id, destination_message_id)
 
 
 class StoreTests(StoreFixture):
@@ -175,12 +177,12 @@ class StoreTests(StoreFixture):
             db.execute("""CREATE TRIGGER fail_confirm BEFORE UPDATE OF last_id ON state
                           BEGIN SELECT RAISE(ABORT, 'disk failure'); END""")
         with self.assertRaises(sqlite3.IntegrityError):
-            self.store.confirm_sent(101)
+            self.store.confirm_sent(101, 501)
         restored = self.open()
         self.assertEqual(restored.state["last_id"], 100)
         self.assertEqual(restored.state["pending_id"], 101)
         with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
-            self.assertEqual(db.execute("SELECT announced FROM tickets").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT announced, destination_message_id FROM tickets").fetchone(), (0, None))
 
     def test_commands_are_atomic_idempotent_and_offsets_never_rewind(self):
         self.store.apply_command(True, 10)
@@ -254,6 +256,242 @@ class DatabaseValidationTests(unittest.TestCase):
             db.execute("DROP TABLE tickets")
         with self.assertRaisesRegex(ValueError, "схема"):
             TicketStore(self.path, ROUTE)
+
+
+class MigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / "tickets.sqlite3"
+
+    def create_v1(self):
+        # Исходная схема v1, а не новая БД с подменённым user_version.
+        with closing(sqlite3.connect(self.path)) as db:
+            db.executescript("""
+                CREATE TABLE state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    route TEXT NOT NULL,
+                    last_id INTEGER NOT NULL CHECK (last_id >= 0),
+                    pending_id INTEGER CHECK (pending_id > last_id),
+                    paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+                    command_offset INTEGER NOT NULL CHECK (command_offset >= 0),
+                    started_at REAL NOT NULL CHECK (started_at >= 0),
+                    last_regular_at REAL NOT NULL CHECK (last_regular_at >= 0),
+                    send_retry_at REAL NOT NULL DEFAULT 0 CHECK (send_retry_at >= 0)
+                );
+                CREATE TABLE tickets (
+                    ticket_id INTEGER PRIMARY KEY CHECK (ticket_id > 0),
+                    author TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at REAL NOT NULL CHECK (created_at >= 0),
+                    source_message_id INTEGER NOT NULL UNIQUE CHECK (source_message_id > 0),
+                    handled INTEGER NOT NULL CHECK (handled IN (0, 1)),
+                    announced INTEGER NOT NULL CHECK (announced IN (0, 1)),
+                    urgent_at REAL CHECK (urgent_at >= 0)
+                );
+                PRAGMA user_version = 1;
+            """)
+            db.execute("INSERT INTO state VALUES (1, ?, 101, 102, 1, 11, 7, 9, 15)",
+                       (json.dumps(ROUTE),))
+            db.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+                (41, "", "", 0, 100, 1, 1, None),
+                (42, "Атлет Иван", "Вопрос", 1, 101, 0, 1, 8),
+                (43, "Атлет Пётр", "Новый вопрос", 2, 102, 0, 0, None),
+            ])
+            db.commit()
+
+    def test_v1_migration_preserves_state_cards_and_pending(self):
+        self.create_v1()
+        with closing(sqlite3.connect(self.path)) as db:
+            before_state = db.execute("SELECT * FROM state").fetchall()
+            before_tickets = db.execute("SELECT * FROM tickets ORDER BY ticket_id").fetchall()
+        with closing(TicketStore(self.path, ROUTE)) as store:
+            self.assertEqual(store.state["pending_id"], 102)
+            self.assertEqual(store.pending_reactions(100), [])
+            with self.assertRaisesRegex(RuntimeError, "102"):
+                store.ensure_no_pending()
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)
+            self.assertEqual(db.execute("SELECT * FROM state").fetchall(), before_state)
+            self.assertEqual(db.execute("SELECT * FROM tickets ORDER BY ticket_id").fetchall(),
+                             [row + (None, None) for row in before_tickets])
+        with closing(TicketStore(self.path, ROUTE)) as store:
+            store.resolve(102, "sent")
+            self.assertEqual(store.state["last_id"], 102)
+            self.assertTrue(store.state["paused"])
+            self.assertEqual(store.state["send_retry_at"], 15)
+            store.process(103, reply(), 20)
+            store.process(104, reply(ticket_id=43), 20)
+            self.assertEqual(store.pending_tickets(), [])
+            self.assertEqual(store.pending_reactions(100), [])
+
+    def test_invalid_v1_is_rejected_without_changing_file(self):
+        cases = (
+            ("wrong route", None, {**ROUTE, "destination_topic_id": 99}),
+            ("unknown version", "PRAGMA user_version = 99", ROUTE),
+            ("wrong schema", "ALTER TABLE tickets RENAME COLUMN author TO unknown", ROUTE),
+            ("dangling pending", "DELETE FROM tickets WHERE ticket_id = 43", ROUTE),
+            ("corrupt time", "UPDATE state SET send_retry_at = 1e999", ROUTE),
+        )
+        for label, mutation, route in cases:
+            with self.subTest(case=label):
+                if self.path.exists():
+                    self.path.unlink()
+                self.create_v1()
+                if mutation:
+                    with closing(sqlite3.connect(self.path)) as db:
+                        db.execute(mutation)
+                        db.commit()
+                before = self.path.read_bytes()
+                with self.assertRaises((ValueError, sqlite3.DatabaseError)):
+                    TicketStore(self.path, route, initial_id=999, now=999)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_failed_migration_rolls_back_both_columns_and_version(self):
+        self.create_v1()
+        sqlite_connect = sqlite3.connect
+
+        class FailingMigration(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql.startswith("ALTER TABLE tickets ADD COLUMN reaction_due_at"):
+                    raise sqlite3.DatabaseError("disk failure")
+                return super().execute(sql, *args)
+
+        def connect(*args, **kwargs):
+            return sqlite_connect(*args, **kwargs, factory=FailingMigration)
+
+        before = self.path.read_bytes()
+        with patch("tracking.sqlite3.connect", side_effect=connect):
+            with self.assertRaisesRegex(sqlite3.DatabaseError, "disk failure"):
+                TicketStore(self.path, ROUTE)
+        self.assertEqual(self.path.read_bytes(), before)
+        with closing(TicketStore(self.path, ROUTE)) as store:
+            self.assertEqual(store.state["pending_id"], 102)
+
+
+class ReactionTests(StoreFixture):
+    def test_own_reply_then_first_other_queues_once_and_survives_restart(self):
+        self.create_and_confirm(when=5, destination_message_id=501)
+        self.store.apply_command(True, 10)
+        self.assertFalse(self.store.process(102, reply(author="  АТЛЕТ\tИван "), 99))
+        self.assertEqual(self.store.pending_reactions(99), [])
+        self.assertEqual(self.store.pending_tickets()[0]["created_at"], 5)
+        self.assertFalse(self.store.process(103, reply(), 100))
+        self.assertEqual(self.store.state["last_id"], 103)
+        self.assertEqual(self.store.pending_tickets(), [])
+        self.store.close()
+        self.store = self.open()
+        expected = [{"ticket_id": 42, "destination_message_id": 501}]
+        self.assertTrue(self.store.state["paused"])
+        self.assertEqual(self.store.pending_reactions(0), expected)
+        with closing(sqlite3.connect(self.path)) as db:
+            self.assertEqual(db.execute("SELECT author, title, handled, reaction_due_at FROM tickets").fetchone(),
+                             ("", "", 1, 0))
+        self.store.defer_reaction(42, 200)
+        self.assertFalse(self.store.process(103, reply(), 100))
+        self.assertFalse(self.store.process(104, reply(author="Другой человек"), 101))
+        self.assertFalse(self.store.process(105, created(), 101))
+        self.assertEqual(self.store.pending_reactions(199), [])
+        self.assertEqual(self.store.pending_reactions(200), expected)
+        self.store.confirm_reaction(42)
+        self.store.confirm_reaction(42)
+        self.assertFalse(self.store.process(106, reply(), 201))
+        self.store.defer_reaction(42, 300)
+        self.assertEqual(self.open().pending_reactions(999), [])
+
+    def test_no_destination_id_or_manual_resolve_does_not_queue(self):
+        self.create_and_confirm()
+        self.store.process(102, reply(), 1)
+        self.store.process(103, created(ticket_id=43), 2)
+        self.store.resolve(103, "sent")
+        self.store.process(104, reply(ticket_id=43), 3)
+        self.assertEqual(self.store.pending_tickets(), [])
+        self.assertEqual(self.store.pending_reactions(999), [])
+
+    def test_handling_and_reaction_queue_rollback_with_cursor(self):
+        self.create_and_confirm(destination_message_id=501)
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
+            db.execute("""CREATE TRIGGER fail_reply BEFORE UPDATE OF last_id ON state
+                          BEGIN SELECT RAISE(ABORT, 'disk failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.process(102, reply(), 1)
+        self.assertEqual(self.store.state["last_id"], 101)
+        self.assertEqual(self.store.pending_reactions(999), [])
+        self.assertEqual(self.store.pending_tickets()[0]["author"], "Атлет Иван")
+        self.assertEqual(len(self.open().pending_tickets()), 1)
+
+    def test_retry_and_global_rate_limit_are_durable_and_never_shorten_barrier(self):
+        self.create_and_confirm(destination_message_id=501)
+        self.create_and_confirm(message_id=102, ticket_id=43, destination_message_id=502)
+        self.store.process(103, reply(), 1)
+        self.store.process(104, reply(ticket_id=43), 1)
+        self.store.defer_reaction(42, 300)
+        self.assertEqual(self.store.state["send_retry_at"], 0)
+        self.assertEqual(self.store.pending_reactions(299), [{"ticket_id": 43, "destination_message_id": 502}])
+        self.store.defer_reaction(43, 400, rate_limited=True)
+        self.store.defer_reaction(42, 350, rate_limited=True)
+        self.store.close()
+        self.store = self.open()
+        self.assertEqual(self.store.state["send_retry_at"], 400)
+        self.assertEqual(self.store.pending_reactions(399), [])
+        self.assertEqual(self.store.pending_reactions(400), [
+            {"ticket_id": 42, "destination_message_id": 501},
+            {"ticket_id": 43, "destination_message_id": 502},
+        ])
+        self.assertEqual(self.store.reminder_plan(399, 1, False)["tickets"], [])
+
+    def test_rate_limit_defer_is_atomic_with_global_barrier(self):
+        self.create_and_confirm(destination_message_id=501)
+        self.store.process(102, reply(), 1)
+        with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
+            db.execute("""CREATE TRIGGER fail_reaction_barrier BEFORE UPDATE OF send_retry_at ON state
+                          BEGIN SELECT RAISE(ABORT, 'disk failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.defer_reaction(42, 400, rate_limited=True)
+        self.assertEqual(self.store.state["send_retry_at"], 0)
+        self.assertEqual(self.open().pending_reactions(0), [{"ticket_id": 42, "destination_message_id": 501}])
+
+    def test_invalid_reaction_inputs_do_not_change_state(self):
+        self.store.process(101, created(), 0)
+        for value in (0, -1, True, 1.5, "501", 2**63):
+            with self.subTest(destination_message_id=value), self.assertRaises(ValueError):
+                self.store.confirm_sent(101, value)
+            with self.subTest(ticket_id=value), self.assertRaises(ValueError):
+                self.store.confirm_reaction(value)
+            with self.subTest(deferred_ticket_id=value), self.assertRaises(ValueError):
+                self.store.defer_reaction(value, 100)
+        self.assertEqual(self.store.state["pending_id"], 101)
+        self.store.confirm_sent(101, 501)
+        self.store.process(102, reply(), 1)
+        for value in (-1, True, "10", float("nan"), float("inf")):
+            with self.subTest(now=value), self.assertRaises(ValueError):
+                self.store.pending_reactions(value)
+            with self.subTest(retry_at=value), self.assertRaises(ValueError):
+                self.store.defer_reaction(42, value)
+        with self.assertRaises(ValueError):
+            self.store.defer_reaction(42, 100, rate_limited=1)
+        self.assertEqual(self.store.pending_reactions(0), [{"ticket_id": 42, "destination_message_id": 501}])
+
+    def test_illegal_reaction_rows_are_rejected(self):
+        self.create_and_confirm(destination_message_id=501)
+        self.store.close()
+        for mutation in (
+            "destination_message_id = 0",
+            "destination_message_id = 1.5",
+            "reaction_due_at = 0",
+            "handled = 1, destination_message_id = NULL, reaction_due_at = 0",
+            "handled = 1, reaction_due_at = -1",
+            "handled = 1, reaction_due_at = 1e999",
+        ):
+            with self.subTest(mutation=mutation):
+                with closing(sqlite3.connect(self.path, isolation_level=None)) as db:
+                    db.execute("PRAGMA ignore_check_constraints = ON")
+                    db.execute("UPDATE tickets SET handled = 0, destination_message_id = 501, reaction_due_at = NULL")
+                    db.execute("UPDATE tickets SET " + mutation)
+                before = self.path.read_bytes()
+                with self.assertRaises(ValueError):
+                    self.open()
+                self.assertEqual(self.path.read_bytes(), before)
 
 
 class ReminderTests(StoreFixture):

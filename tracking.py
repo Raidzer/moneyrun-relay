@@ -10,11 +10,12 @@ import time
 
 URGENT_AFTER_SECONDS = 20 * 60 * 60
 URGENT_INTERVAL_SECONDS = 30 * 60
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATE_COLUMNS = ("id", "route", "last_id", "pending_id", "paused", "command_offset",
                  "started_at", "last_regular_at", "send_retry_at")
-TICKET_COLUMNS = ("ticket_id", "author", "title", "created_at", "source_message_id",
-                  "handled", "announced", "urgent_at")
+V1_TICKET_COLUMNS = ("ticket_id", "author", "title", "created_at", "source_message_id",
+                     "handled", "announced", "urgent_at")
+TICKET_COLUMNS = V1_TICKET_COLUMNS + ("destination_message_id", "reaction_due_at")
 
 
 def normalize_author(author):
@@ -54,7 +55,7 @@ def _nonnegative_time(value):
 
 
 def _message_id(value, minimum=1):
-    if type(value) is not int or value < minimum:
+    if type(value) is not int or not minimum <= value <= 2**63 - 1:
         raise ValueError("Некорректный ID сообщения.")
 
 
@@ -100,22 +101,37 @@ class TicketStore:
                         source_message_id INTEGER NOT NULL UNIQUE CHECK (source_message_id > 0),
                         handled INTEGER NOT NULL CHECK (handled IN (0, 1)),
                         announced INTEGER NOT NULL CHECK (announced IN (0, 1)),
-                        urgent_at REAL CHECK (urgent_at >= 0)
+                        urgent_at REAL CHECK (urgent_at >= 0),
+                        destination_message_id INTEGER CHECK (destination_message_id > 0),
+                        reaction_due_at REAL CHECK (reaction_due_at >= 0)
                     )""")
                     self._db.execute("INSERT INTO state VALUES (1, ?, ?, NULL, 0, 0, ?, ?, 0)",
                                      (route_json, initial_id, started_at, started_at))
                     self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self._validate(route)
+            if self._db.execute("PRAGMA user_version").fetchone()[0] == 1:
+                with self._db:
+                    # DDL тоже откатывается: сначала проверяем всю старую БД под блокировкой.
+                    self._db.execute("BEGIN IMMEDIATE")
+                    self._validate(route, version=1)
+                    self._db.execute("ALTER TABLE tickets ADD COLUMN destination_message_id "
+                                     "INTEGER CHECK (destination_message_id > 0)")
+                    self._db.execute("ALTER TABLE tickets ADD COLUMN reaction_due_at "
+                                     "REAL CHECK (reaction_due_at >= 0)")
+                    self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    self._validate(route)
+            else:
+                self._validate(route)
         except Exception:
             self._db.close()
             raise
 
-    def _validate(self, route):
+    def _validate(self, route, version=SCHEMA_VERSION):
         if self._db.execute("PRAGMA integrity_check").fetchall()[0][0] != "ok":
             raise ValueError("База учёта тикетов повреждена; автоматический сброс отменён.")
-        if self._db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+        if self._db.execute("PRAGMA user_version").fetchone()[0] != version:
             raise ValueError("Неизвестная версия базы учёта тикетов.")
-        for table, columns in (("state", STATE_COLUMNS), ("tickets", TICKET_COLUMNS)):
+        ticket_columns = V1_TICKET_COLUMNS if version == 1 else TICKET_COLUMNS
+        for table, columns in (("state", STATE_COLUMNS), ("tickets", ticket_columns)):
             found = tuple(row["name"] for row in self._db.execute(f"PRAGMA table_info({table})"))
             if found != columns:
                 raise ValueError("Некорректная схема базы учёта тикетов.")
@@ -130,6 +146,14 @@ class TicketStore:
         _nonnegative_time(state["started_at"])
         _nonnegative_time(state["last_regular_at"])
         _nonnegative_time(state["send_retry_at"])
+        if version == SCHEMA_VERSION:
+            for ticket in self._db.execute("SELECT * FROM tickets"):
+                if ticket["destination_message_id"] is not None:
+                    _message_id(ticket["destination_message_id"])
+                if ticket["reaction_due_at"] is not None:
+                    _nonnegative_time(ticket["reaction_due_at"])
+                    if not ticket["handled"] or ticket["destination_message_id"] is None:
+                        raise ValueError("Некорректная реакция в базе учёта тикетов.")
         if state["pending_id"] is not None:
             _message_id(state["pending_id"])
             pending = self._db.execute(
@@ -177,7 +201,7 @@ class TicketStore:
                         raise ValueError("В событии создания отсутствует тема тикета.")
                     if ticket is None:
                         self._db.execute(
-                            "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, 0, 0, NULL)",
+                            "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, 0, 0, NULL, NULL, NULL)",
                             (ticket_id, author, event["title"], _nonnegative_time(created_at), message_id),
                         )
                     if ticket is None or (ticket["source_message_id"] == message_id
@@ -187,27 +211,62 @@ class TicketStore:
                 elif ticket is not None and not ticket["handled"]:
                     if normalize_author(author) != normalize_author(ticket["author"]):
                         self._db.execute(
-                            "UPDATE tickets SET handled = 1, author = '', title = '' WHERE ticket_id = ?",
+                            "UPDATE tickets SET handled = 1, author = '', title = '', "
+                            "reaction_due_at = CASE WHEN destination_message_id IS NOT NULL THEN 0 END "
+                            "WHERE ticket_id = ?",
                             (ticket_id,),
                         )
             self._db.execute("UPDATE state SET last_id = ? WHERE id = 1", (message_id,))
         return False
 
-    def confirm_sent(self, message_id):
-        self.resolve(message_id, "sent")
+    def confirm_sent(self, message_id, destination_message_id=None):
+        _message_id(message_id)
+        if destination_message_id is not None:
+            _message_id(destination_message_id)
+        with self._db:
+            if self.state["pending_id"] != message_id:
+                raise ValueError("Указанный ID не совпадает с ожидающим проверки сообщением.")
+            self._db.execute("UPDATE tickets SET announced = 1, destination_message_id = ? "
+                             "WHERE source_message_id = ?", (destination_message_id, message_id))
+            self._db.execute("UPDATE state SET last_id = ?, pending_id = NULL WHERE id = 1", (message_id,))
 
     def resolve(self, message_id, result):
         _message_id(message_id)
         if result not in ("sent", "retry"):
             raise ValueError("Нужно указать результат проверки: sent или retry.")
+        if result == "sent":
+            self.confirm_sent(message_id)
+            return
         with self._db:
             if self.state["pending_id"] != message_id:
                 raise ValueError("Указанный ID не совпадает с ожидающим проверки сообщением.")
-            if result == "sent":
-                self._db.execute("UPDATE tickets SET announced = 1 WHERE source_message_id = ?", (message_id,))
-                self._db.execute("UPDATE state SET last_id = ?, pending_id = NULL WHERE id = 1", (message_id,))
-            else:
-                self._db.execute("UPDATE state SET pending_id = NULL WHERE id = 1")
+            self._db.execute("UPDATE state SET pending_id = NULL WHERE id = 1")
+
+    def pending_reactions(self, now):
+        now = _nonnegative_time(now)
+        if now < self.state["send_retry_at"]:
+            return []
+        return [dict(row) for row in self._db.execute(
+            "SELECT ticket_id, destination_message_id FROM tickets "
+            "WHERE reaction_due_at <= ? ORDER BY reaction_due_at, ticket_id", (now,)
+        )]
+
+    def confirm_reaction(self, ticket_id):
+        _message_id(ticket_id)
+        with self._db:
+            self._db.execute("UPDATE tickets SET reaction_due_at = NULL WHERE ticket_id = ?", (ticket_id,))
+
+    def defer_reaction(self, ticket_id, retry_at, *, rate_limited=False):
+        _message_id(ticket_id)
+        retry_at = _nonnegative_time(retry_at)
+        if type(rate_limited) is not bool:
+            raise ValueError("Некорректный признак ограничения Telegram.")
+        with self._db:
+            self._db.execute("UPDATE tickets SET reaction_due_at = ? "
+                             "WHERE ticket_id = ? AND reaction_due_at IS NOT NULL", (retry_at, ticket_id))
+            if rate_limited:
+                self._db.execute("UPDATE state SET send_retry_at = max(send_retry_at, ?) WHERE id = 1",
+                                 (retry_at,))
 
     def apply_command(self, paused, update_id):
         if type(paused) is not bool:

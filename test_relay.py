@@ -2,20 +2,22 @@
 
 import asyncio
 from datetime import datetime, timezone
+from http.client import IncompleteRead
 import json
 from pathlib import Path
 import signal
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from urllib.error import HTTPError
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from telethon.tl.types import Message, MessageReplyHeader, PeerChannel
 from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
                    poll_interval_seconds, read_state, resolve_pending, selected,
                    single_instance, validate_config, write_json, reminder_settings,
-                   quiet_hours, reminder_payloads, run_tracking, bot_call, BotRateLimitError)
+                   quiet_hours, reminder_payloads, run_tracking, bot_call, bot_request, BotRateLimitError)
 from tracking import TicketStore
 
 
@@ -30,10 +32,20 @@ TEXT = ("#KhromushkinTeam\n\nПользователь Тестовый Атле�
         "Хорошо, если ещё возникнут вопросы, мы всегда на связи!\n\nХороших тренировок 🙂")
 CREATED = TEXT.replace("написал в тикет #123456", "создал новый тикет #123456 - Вопрос")
 BOT = {"type": "group", "id": 1234, "username": "test_relay_bot", "status": "administrator"}
+SENT = {"message_id": 900}
+REAL_SLEEP = asyncio.sleep
 
 
 async def idle_commands(*args):
     await args[4].wait()
+
+
+async def no_delay(seconds):
+    await REAL_SLEEP(0)
+
+
+async def skip_poll_delay(event, seconds):
+    await no_delay(seconds)
 
 
 def stored_state(path):
@@ -50,6 +62,21 @@ def message(text=TEXT, message_id=101, **fields):
 
 
 class RelayTests(unittest.TestCase):
+    def test_interrupted_http_body_becomes_sanitized_retryable_error(self):
+        for http_error in (False, True):
+            with self.subTest(http_error=http_error):
+                response = MagicMock()
+                response.read.side_effect = IncompleteRead(b'{"ok":', 12)
+                if http_error:
+                    error = HTTPError("https://example.test/botsecret", 502, "gateway", {}, response)
+                    opener = patch("relay.urlopen", side_effect=error)
+                else:
+                    response.__enter__.return_value = response
+                    opener = patch("relay.urlopen", return_value=response)
+                with opener, self.assertRaises(RuntimeError) as caught:
+                    bot_request("secret", "setMessageReaction", {})
+                self.assertNotIn("secret", str(caught.exception))
+
     def test_reminder_configuration_and_moscow_quiet_boundaries(self):
         with patch.dict("os.environ", {}, clear=True):
             settings = reminder_settings()
@@ -269,7 +296,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 sent += 1
                 if sent == 2:
                     raise BotRateLimitError(60)
-                return BOT
+                return SENT
 
             async def wait(event, seconds):
                 event.set()
@@ -321,7 +348,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("#1 ·", payload["text"])
                 self.assertIn("#2 ·", payload["text"])
                 stop.set()
-                return BOT
+                return SENT
 
             client = AsyncMock()
             client.get_messages.side_effect = read
@@ -388,7 +415,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             async def api(token, method, payload, **kwargs):
                 self.assertTrue(payload["text"].startswith("Срочно ❗❗❗:"))
                 stop.set()
-                return BOT
+                return SENT
 
             try:
                 with patch("relay.command_loop", side_effect=idle_commands), \
@@ -454,7 +481,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 if payload["text"] == CREATED:
                     self.assertTrue(store.state["paused"])
                     stop.set()
-                return BOT
+                return SENT
 
             try:
                 with patch("relay.bot_call", side_effect=api), \
@@ -487,7 +514,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
                  patch("telethon.TelegramClient", return_value=client), patch("relay.signal.signal"), \
-                 patch("relay.bot_call", return_value=BOT) as api, patch("builtins.print"), \
+                 patch("relay.bot_call", side_effect=lambda token, method, payload, **kwargs:
+                       SENT if method == "sendMessage" else BOT) as api, patch("builtins.print"), \
                  patch("relay.command_loop", side_effect=idle_commands), \
                  patch("relay.asyncio.sleep", new_callable=AsyncMock), \
                  patch("relay.wait_or_stop", side_effect=stop_wait):
@@ -655,6 +683,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 if method == "sendMessage":
                     url = payload["reply_markup"]["inline_keyboard"][0][0]["url"]
                     events.append(("send", int(url.rsplit("/", 1)[1])))
+                    return SENT
                 return BOT
 
             async def wait(stop, seconds):
@@ -717,6 +746,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         payloads.append(payload)
                         if mode == "failure":
                             raise RuntimeError("uncertain delivery")
+                        return SENT
                     return {"type": "supergroup"}
 
                 with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
@@ -834,6 +864,233 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             prompt.assert_not_called()
             client.start.assert_not_awaited()
             client.disconnect.assert_awaited_once()
+
+
+class ReactionTests(unittest.IsolatedAsyncioTestCase):
+    now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
+    settings = {"interval": 14400, "start": 1380, "end": 540}
+
+    async def test_first_other_reply_reacts_once_to_delivered_card_without_forwarding_replies(self):
+        config = {**CONFIG, "destination_topic_id": 73}
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", config, initial_id=100, now=self.now)
+            store.process(101, {"kind": "created", "ticket_id": 2, "author": "Старый Атлет",
+                                "title": "Старая карточка"}, self.now)
+            store.confirm_sent(101)  # Старую карточку без целевого ID не разыскиваем.
+            stop = asyncio.Event()
+            reads = 0
+            calls = []
+
+            async def read(*args, **kwargs):
+                nonlocal reads
+                reads += 1
+                if reads == 1:
+                    return [message(CREATED, message_id=102), message(TEXT, message_id=103)]
+                if reads == 2:
+                    self.assertEqual(store.pending_reactions(self.now), [])
+                    self.assertEqual(len(store.pending_tickets()), 2)
+                    other = TEXT.replace("Тестовый Атлет", "Другой Человек")
+                    return [message(other, message_id=104), message(other, message_id=105),
+                            message(other.replace("#123456", "#2"), message_id=106)]
+                await stop.wait()
+                return []
+
+            async def api(token, method, payload, **kwargs):
+                calls.append((method, payload))
+                if method == "sendMessage":
+                    return SENT
+                self.assertEqual(method, "setMessageReaction")
+                self.assertEqual(payload, {"chat_id": config["destination_chat_id"], "message_id": 900,
+                                           "reaction": [{"type": "emoji", "emoji": "👀"}]})
+                self.assertFalse(kwargs["wait_on_rate_limit"])
+                stop.set()
+                return True
+
+            client = AsyncMock()
+            client.get_messages.side_effect = read
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", side_effect=api), patch("relay.asyncio.sleep", side_effect=no_delay), \
+                     patch("relay.wait_or_stop", side_effect=skip_poll_delay), \
+                     patch("relay.time.time", return_value=self.now), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(client, object(), config, store, stop, 60,
+                                                        self.settings, "dummy", BOT), 2)
+                self.assertEqual([method for method, _ in calls], ["sendMessage", "setMessageReaction"])
+                self.assertEqual(calls[0][1]["text"], CREATED)
+                self.assertEqual(calls[0][1]["message_thread_id"], 73)
+                self.assertEqual(store.state["last_id"], 106)
+                self.assertEqual(store.pending_tickets(), [])
+                self.assertEqual(store.pending_reactions(self.now + 86400), [])
+            finally:
+                store.close()
+
+    async def test_pending_reaction_survives_restart_and_sends_while_paused_at_night(self):
+        night = datetime(2026, 10, 15, 21, tzinfo=timezone.utc).timestamp()
+        self.assertTrue(quiet_hours(night, self.settings))
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "tickets.sqlite3"
+            store = TicketStore(path, CONFIG, initial_id=100, now=night)
+            store.process(101, {"kind": "created", "ticket_id": 1, "author": "Атлет", "title": "Вопрос"}, night)
+            store.confirm_sent(101, 900)
+            store.process(102, {"kind": "reply", "ticket_id": 1, "author": "Другой"}, night)
+            store.apply_command(True, 1)
+            store.close()
+            store = TicketStore(path, CONFIG)
+            stop = asyncio.Event()
+
+            async def read(*args, **kwargs):
+                await stop.wait()
+                return []
+
+            async def api(token, method, payload, **kwargs):
+                self.assertEqual(method, "setMessageReaction")
+                self.assertEqual(payload["message_id"], 900)
+                self.assertTrue(store.state["paused"])
+                stop.set()
+                return True
+
+            client = AsyncMock()
+            client.get_messages.side_effect = read
+            try:
+                self.assertEqual(store.pending_reactions(night), [{"ticket_id": 1, "destination_message_id": 900}])
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", side_effect=api) as calls, \
+                     patch("relay.asyncio.sleep", side_effect=no_delay), \
+                     patch("relay.time.time", return_value=night), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(client, object(), CONFIG, store, stop, 60,
+                                                        self.settings, "dummy", BOT), 2)
+                calls.assert_awaited_once()
+                self.assertEqual(store.pending_reactions(night), [])
+            finally:
+                store.close()
+            store = TicketStore(path, CONFIG)
+            try:
+                self.assertEqual(store.pending_reactions(night), [])
+            finally:
+                store.close()
+
+    async def test_failed_reaction_defers_durably_without_blocking_reader_or_commands(self):
+        for error, delay in ((RuntimeError("reaction failed"), 300), (BotRateLimitError(600), 600)):
+            with self.subTest(error=error), TemporaryDirectory() as folder:
+                path = Path(folder) / "tickets.sqlite3"
+                store = TicketStore(path, CONFIG, initial_id=100, now=self.now - 86400)
+                store.process(101, {"kind": "created", "ticket_id": 1, "author": "Атлет", "title": "Вопрос"}, self.now - 86400)
+                store.confirm_sent(101, 900)
+                store.process(102, {"kind": "reply", "ticket_id": 1, "author": "Другой"}, self.now)
+                failed, commanded, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+                reads = 0
+
+                async def read(*args, **kwargs):
+                    nonlocal reads
+                    reads += 1
+                    await failed.wait()
+                    if reads == 1:
+                        return [message("#OtherClub\ntext", message_id=103)]
+                    await commanded.wait()
+                    stop.set()
+                    return []
+
+                async def commands(*args):
+                    await failed.wait()
+                    store.apply_command(True, 1)
+                    commanded.set()
+                    await stop.wait()
+
+                async def api(token, method, payload, **kwargs):
+                    self.assertEqual(method, "setMessageReaction")
+                    self.assertFalse(kwargs["wait_on_rate_limit"])
+                    failed.set()
+                    raise error
+
+                client = AsyncMock()
+                client.get_messages.side_effect = read
+                try:
+                    with patch("relay.command_loop", side_effect=commands), \
+                         patch("relay.bot_call", side_effect=api) as calls, \
+                         patch("relay.asyncio.sleep", side_effect=no_delay), \
+                         patch("relay.wait_or_stop", side_effect=skip_poll_delay), \
+                         patch("relay.time.time", return_value=self.now), patch("relay.LOG"), patch("builtins.print"):
+                        await asyncio.wait_for(run_tracking(client, object(), CONFIG, store, stop, 60,
+                                                            self.settings, "dummy", BOT), 2)
+                    calls.assert_awaited_once()
+                    self.assertEqual(reads, 2)
+                    self.assertEqual(store.state["last_id"], 103)
+                    self.assertTrue(store.state["paused"])
+                    self.assertIsNone(store.state["pending_id"])
+                    self.assertEqual(store.pending_tickets(), [])
+                    self.assertEqual(store.reminder_plan(self.now + 86400, 14400, False)["tickets"], [])
+                    self.assertEqual(store.state["send_retry_at"], self.now + delay if isinstance(error, BotRateLimitError) else 0)
+                finally:
+                    store.close()
+                store = TicketStore(path, CONFIG)
+                try:
+                    self.assertEqual(store.pending_reactions(self.now + delay - 1), [])
+                    self.assertEqual(store.pending_reactions(self.now + delay),
+                                     [{"ticket_id": 1, "destination_message_id": 900}])
+                    self.assertEqual(store.pending_tickets(), [])
+                finally:
+                    store.close()
+
+    async def test_stop_cancels_in_flight_reaction_and_keeps_it_pending(self):
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100, now=self.now)
+            store.process(101, {"kind": "created", "ticket_id": 1, "author": "Атлет", "title": "Вопрос"}, self.now)
+            store.confirm_sent(101, 900)
+            store.process(102, {"kind": "reply", "ticket_id": 1, "author": "Другой"}, self.now)
+            entered, stop = asyncio.Event(), asyncio.Event()
+
+            async def read(*args, **kwargs):
+                await entered.wait()
+                stop.set()
+                return []
+
+            async def api(token, method, payload, **kwargs):
+                self.assertEqual(method, "setMessageReaction")
+                entered.set()
+                await asyncio.Event().wait()
+
+            client = AsyncMock()
+            client.get_messages.side_effect = read
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", side_effect=api) as calls, \
+                     patch("relay.asyncio.sleep", side_effect=no_delay), \
+                     patch("relay.time.time", return_value=self.now), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(client, object(), CONFIG, store, stop, 60,
+                                                        self.settings, "dummy", BOT), 2)
+                calls.assert_awaited_once()
+                self.assertEqual(store.pending_reactions(self.now), [{"ticket_id": 1, "destination_message_id": 900}])
+                self.assertEqual(store.pending_tickets(), [])
+                self.assertIsNone(store.state["pending_id"])
+            finally:
+                store.close()
+
+    async def test_creation_without_valid_destination_id_keeps_uncertain_delivery_pending(self):
+        for result in ({}, None, {"message_id": True}, {"message_id": "900"}, {"message_id": 0}):
+            with self.subTest(result=result), TemporaryDirectory() as folder:
+                path = Path(folder) / "tickets.sqlite3"
+                store = TicketStore(path, CONFIG, initial_id=100, now=self.now)
+                client = AsyncMock()
+                client.get_messages.return_value = [message(CREATED)]
+                try:
+                    with patch("relay.command_loop", side_effect=idle_commands), \
+                         patch("relay.bot_call", return_value=result) as calls, \
+                         patch("relay.asyncio.sleep", side_effect=no_delay), \
+                         patch("relay.time.time", return_value=self.now), patch("builtins.print"):
+                        with self.assertRaises(RuntimeError):
+                            await asyncio.wait_for(run_tracking(client, object(), CONFIG, store, asyncio.Event(),
+                                                                60, self.settings, "dummy", BOT), 2)
+                    calls.assert_awaited_once()
+                    self.assertEqual(calls.await_args.args[1], "sendMessage")
+                finally:
+                    store.close()
+                store = TicketStore(path, CONFIG)
+                try:
+                    self.assertEqual(store.state["last_id"], 100)
+                    self.assertEqual(store.state["pending_id"], 101)
+                    self.assertEqual(store.pending_reactions(self.now + 86400), [])
+                finally:
+                    store.close()
 
 
 if __name__ == "__main__":

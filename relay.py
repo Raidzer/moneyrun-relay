@@ -5,6 +5,7 @@ import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from getpass import getpass
+from http.client import HTTPException
 import json
 import logging
 import os
@@ -281,9 +282,9 @@ def bot_request(token, method, payload):
         # Не выводим URL исключения: он содержит токен.
         try:
             return json.loads(error.read())
-        except (ValueError, OSError):
+        except (ValueError, OSError, HTTPException):
             raise RuntimeError(f"Telegram Bot API: HTTP {error.code}.") from None
-    except (URLError, TimeoutError, OSError, ValueError):
+    except (URLError, TimeoutError, OSError, ValueError, HTTPException):
         raise RuntimeError("Не получено подтверждение Telegram Bot API. "
                            "Перед повторным запуском проверь группу: сообщение могло дойти.") from None
 
@@ -316,13 +317,14 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
     from telethon.errors import FloodWaitError
 
     send_lock, acknowledgements = asyncio.Lock(), asyncio.Queue(maxsize=100)
+    reaction_ready = asyncio.Event()
     last_send = 0.0
 
-    async def send(payload, *, reminder=False, regular=False, before_send=None):
+    async def send(payload, *, reminder=False, regular=False, before_send=None, reaction=False):
         nonlocal last_send
         async with send_lock:
             while store.state["send_retry_at"] > time.time():
-                if reminder:
+                if reminder or reaction:
                     return False
                 await asyncio.sleep(store.state["send_retry_at"] - time.time())
             await asyncio.sleep(max(0, 3.2 - (time.monotonic() - last_send)))
@@ -336,9 +338,12 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 if reminder:
                     result = await bot_call(token, "sendMessage", payload, allowed=allowed,
                                             wait_on_rate_limit=False)
+                elif reaction:
+                    result = await bot_call(token, "setMessageReaction", payload,
+                                            wait_on_rate_limit=False)
                 else:
                     result = await bot_call(token, "sendMessage", payload)
-                return result is not None
+                return result
             finally:
                 last_send = time.monotonic()
 
@@ -357,6 +362,37 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 LOG.warning("Не удалось подтвердить команду в Telegram; состояние сохранено.")
             finally:
                 acknowledgements.task_done()
+
+    async def react_to_handled():
+        while not stop.is_set():
+            reaction_ready.clear()
+            for ticket in store.pending_reactions(time.time()):
+                if stop.is_set():
+                    return
+                payload = {"chat_id": config["destination_chat_id"],
+                           "message_id": ticket["destination_message_id"],
+                           "reaction": [{"type": "emoji", "emoji": "👀"}]}
+                try:
+                    if not await send(payload, reaction=True):
+                        break
+                except BotRateLimitError as error:
+                    store.defer_reaction(ticket["ticket_id"], time.time() + error.seconds,
+                                         rate_limited=True)
+                    LOG.warning("Telegram отложил отправки на %s с.; срок сохранён, бот продолжает работу.",
+                                error.seconds)
+                    break
+                except RuntimeError:
+                    store.defer_reaction(ticket["ticket_id"], time.time() + 300)
+                    LOG.warning("Не удалось поставить 👀 на тикет #%s; повтор через 5 минут. "
+                                "Проверь, что карточка существует и реакция разрешена в группе.",
+                                ticket["ticket_id"])
+                else:
+                    store.confirm_reaction(ticket["ticket_id"])
+                    LOG.info("Поставлена реакция 👀 на тикет #%s.", ticket["ticket_id"])
+            try:
+                await asyncio.wait_for(reaction_ready.wait(), timeout=poll_interval)
+            except asyncio.TimeoutError:
+                pass
 
     async def read_and_remind():
         while not stop.is_set():
@@ -385,9 +421,15 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                     raise RuntimeError("У сообщения включена защита содержимого; обработка остановлена.")
                 created_at = message.date.timestamp() if event else 0
                 if store.process(message.id, event, created_at):
-                    await send(message_payload(message, config))
-                    store.confirm_sent(message.id)
+                    delivery = await send(message_payload(message, config))
+                    target_id = delivery.get("message_id") if isinstance(delivery, dict) else None
+                    if type(target_id) is not int or target_id <= 0:
+                        raise RuntimeError("Telegram не подтвердил ID доставленной карточки; "
+                                           "сначала нужна проверка и resolve.")
+                    store.confirm_sent(message.id, target_id)
                     print(f"Передано сообщение {message.id}.")
+                if event and event["kind"] == "reply":
+                    reaction_ready.set()
             if len(messages) == 100:
                 continue
             if stop.is_set():
@@ -422,6 +464,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
     tasks = [reader, asyncio.create_task(command_loop(token, bot["username"], config, store,
                                                       stop, bot_call, enqueue_ack)),
              asyncio.create_task(acknowledge())]
+    tasks.append(asyncio.create_task(react_to_handled()))
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
@@ -433,7 +476,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
             else:
                 await reader  # Сохранить результат начатой отправки нового тикета.
         elif reader not in done:
-            raise RuntimeError("Обработка команд неожиданно остановилась.")
+            raise RuntimeError("Одна из фоновых задач неожиданно остановилась.")
     finally:
         for task in tasks:
             task.cancel()
