@@ -386,7 +386,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 clock[0] = evening + 2
 
             async def api(token, method, payload, **kwargs):
-                self.assertTrue(payload["text"].startswith("Срочно:"))
+                self.assertTrue(payload["text"].startswith("Срочно ❗❗❗:"))
                 stop.set()
                 return BOT
 

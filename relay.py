@@ -231,13 +231,13 @@ def quiet_hours(now, settings):
 
 def reminder_payloads(plan, config, now):
     title = ("Ожидают первого ответа" if plan["regular_due"]
-             else "Срочно: обращения ожидают ответа более 20 часов")
+             else "Срочно ❗❗❗: обращения ожидают ответа более 20 часов")
     heading = title + ":\n\n"
     chunks, text = [], heading
     for ticket in plan["tickets"]:
         hours = max(0, int((now - ticket["created_at"]) / 3600))
         minutes = max(0, int((now - ticket["created_at"]) / 60)) % 60
-        urgent = "СРОЧНО · " if now - ticket["created_at"] > 20 * 3600 else ""
+        urgent = "СРОЧНО ❗❗❗ · " if now - ticket["created_at"] > 20 * 3600 else ""
         source = str(config["source_chat_id"])
         link = (f"https://t.me/c/{source[4:]}/{ticket['source_message_id']}\n"
                 if config["source_chat_id"] < -1000000000000 else "")
