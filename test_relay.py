@@ -6,11 +6,12 @@ from http.client import IncompleteRead
 import json
 from pathlib import Path
 import signal
+import sqlite3
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.error import HTTPError
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from telethon.tl.types import (Message, MessageReplyHeader, MessageFwdHeader, PeerChannel, PeerUser,
                               MessageEntityBold, MessageEntityTextUrl)
@@ -48,6 +49,13 @@ async def no_delay(seconds):
 
 async def skip_poll_delay(event, seconds):
     await no_delay(seconds)
+
+
+def mock_client():
+    client = AsyncMock()
+    client.disconnect_future = asyncio.get_running_loop().create_future()
+    type(client).disconnected = PropertyMock(side_effect=lambda: asyncio.shield(client.disconnect_future))
+    return client
 
 
 def stored_state(path):
@@ -333,6 +341,216 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         env_patch.start()
         self.addCleanup(env_patch.stop)
 
+    async def test_final_disconnect_stops_tracking_and_preserves_cursor(self):
+        for error in (None, OSError("network unavailable")):
+            with self.subTest(error=error), TemporaryDirectory() as folder:
+                store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100)
+                client, stop, entered = mock_client(), asyncio.Event(), asyncio.Event()
+
+                async def read(*args, **kwargs):
+                    entered.set()
+                    await asyncio.Event().wait()
+
+                async def commands(*args):
+                    await entered.wait()
+                    if error is None:
+                        client.disconnect_future.set_result(None)
+                    else:
+                        client.disconnect_future.set_exception(error)
+                    await stop.wait()
+
+                client.get_messages.side_effect = read
+                try:
+                    with patch("relay.command_loop", side_effect=commands):
+                        with self.assertRaisesRegex(RuntimeError, "Соединение с источником окончательно потеряно"):
+                            await asyncio.wait_for(run_tracking(
+                                client, object(), CONFIG, store, stop, 60,
+                                {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                    self.assertEqual(store.state["last_id"], 100)
+                    self.assertIsNone(store.state["pending_id"])
+                finally:
+                    if client.disconnect_future.done() and not client.disconnect_future.cancelled():
+                        client.disconnect_future.exception()
+                    store.close()
+
+    async def test_final_disconnect_waits_for_card_confirmation_before_restart(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "tickets.sqlite3"
+            store = TicketStore(path, CONFIG, initial_id=100)
+            client, stop = mock_client(), asyncio.Event()
+            client.get_messages.return_value = [message(CREATED)]
+
+            async def api(*args, **kwargs):
+                self.assertEqual(store.state["pending_id"], 101)
+                client.disconnect_future.set_exception(OSError("network unavailable"))
+                await stop.wait()
+                return SENT
+
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", side_effect=api), patch("builtins.print"):
+                    with self.assertRaisesRegex(RuntimeError, "Соединение с источником окончательно потеряно"):
+                        await asyncio.wait_for(run_tracking(
+                            client, object(), CONFIG, store, stop, 60,
+                            {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                self.assertEqual(store.state["last_id"], 101)
+                self.assertIsNone(store.state["pending_id"])
+            finally:
+                if client.disconnect_future.done() and not client.disconnect_future.cancelled():
+                    client.disconnect_future.exception()
+                store.close()
+
+            db = sqlite3.connect(path)
+            try:
+                self.assertEqual(db.execute("SELECT destination_message_id FROM tickets").fetchone(), (900,))
+            finally:
+                db.close()
+            store = TicketStore(path, CONFIG)
+            client, stop = mock_client(), asyncio.Event()
+            client.get_messages.return_value = []
+
+            async def finish_poll(event, seconds):
+                event.set()
+
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.wait_or_stop", side_effect=finish_poll), \
+                     patch("relay.bot_call") as api, patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(
+                        client, object(), CONFIG, store, stop, 60,
+                        {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                api.assert_not_awaited()
+                self.assertEqual(client.get_messages.await_args.kwargs["min_id"], 101)
+                self.assertIsNone(store.state["pending_id"])
+            finally:
+                store.close()
+
+    async def test_manual_stop_with_disconnect_remains_graceful(self):
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100)
+            client, stop, entered = mock_client(), asyncio.Event(), asyncio.Event()
+
+            async def read(*args, **kwargs):
+                entered.set()
+                await asyncio.Event().wait()
+
+            async def commands(*args):
+                await entered.wait()
+                stop.set()
+                client.disconnect_future.set_exception(OSError("network unavailable"))
+
+            client.get_messages.side_effect = read
+            try:
+                with patch("relay.command_loop", side_effect=commands), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(
+                        client, object(), CONFIG, store, stop, 60,
+                        {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                self.assertEqual(store.state["last_id"], 100)
+            finally:
+                if client.disconnect_future.done() and not client.disconnect_future.cancelled():
+                    client.disconnect_future.exception()
+                store.close()
+
+    async def test_cancelling_tracking_keeps_library_disconnect_future_pending(self):
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100)
+            client, stop, entered = mock_client(), asyncio.Event(), asyncio.Event()
+
+            async def read(*args, **kwargs):
+                entered.set()
+                await asyncio.Event().wait()
+
+            client.get_messages.side_effect = read
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands):
+                    task = asyncio.create_task(run_tracking(
+                        client, object(), CONFIG, store, stop, 60,
+                        {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                self.assertFalse(client.disconnect_future.done())
+                self.assertEqual(store.state["last_id"], 100)
+            finally:
+                store.close()
+
+    async def test_transient_source_error_retries_without_finishing_disconnect_future(self):
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100)
+            client, stop = mock_client(), asyncio.Event()
+            client.get_messages.side_effect = [OSError("temporary network outage"),
+                                               [message("#OtherClub", message_id=101)]]
+            waits = []
+
+            async def wait(event, seconds):
+                waits.append(seconds)
+                if len(waits) == 2:
+                    event.set()
+
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.wait_or_stop", side_effect=wait), patch("relay.LOG"), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(
+                        client, object(), CONFIG, store, stop, 60,
+                        {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                self.assertEqual(client.get_messages.await_count, 2)
+                self.assertEqual(waits, [60, 60])
+                self.assertEqual(store.state["last_id"], 101)
+                self.assertFalse(client.disconnect_future.done())
+            finally:
+                store.close()
+
+    async def test_reply_arriving_during_card_send_is_read_before_reminders(self):
+        now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
+        with TemporaryDirectory() as folder:
+            store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100, now=now-25*3600)
+            store.process(101, {"kind": "created", "ticket_id": 123456,
+                                "author": "Тестовый Атлет", "title": "Вопрос"}, now-25*3600)
+            store.confirm_sent(101)
+            client, stop = mock_client(), asyncio.Event()
+            new_card = CREATED.replace("#123456", "#123457")
+            reply_available = False
+            summaries = []
+
+            async def read(source, **kwargs):
+                if kwargs["min_id"] == 101:
+                    return [message(new_card, message_id=102, date=datetime.fromtimestamp(now, timezone.utc))]
+                if kwargs["min_id"] == 102 and reply_available:
+                    return [message(TEXT.replace("Тестовый Атлет", "Другой Человек"), message_id=103)]
+                return []
+
+            async def api(token, method, payload, **kwargs):
+                nonlocal reply_available
+                self.assertEqual(method, "sendMessage")
+                if payload["text"] == new_card:
+                    reply_available = True
+                else:
+                    summaries.append(payload["text"])
+                return SENT
+
+            async def finish_poll(event, seconds):
+                event.set()
+
+            client.get_messages.side_effect = read
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", side_effect=api), patch("relay.asyncio.sleep", side_effect=no_delay), \
+                     patch("relay.wait_or_stop", side_effect=finish_poll), \
+                     patch("relay.time.time", return_value=now), patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(
+                        client, object(), CONFIG, store, stop, 60,
+                        {"interval": 14400, "start": 1380, "end": 540}, "dummy", BOT), 1)
+                self.assertTrue(summaries)
+                self.assertTrue(all("#123456 ·" not in text for text in summaries))
+                self.assertIn("#123457 ·", summaries[0])
+                self.assertEqual([call.kwargs["min_id"] for call in client.get_messages.await_args_list],
+                                 [101, 102])
+                self.assertEqual(store.state["last_id"], 103)
+                self.assertEqual([ticket["ticket_id"] for ticket in store.pending_tickets()], [123457])
+            finally:
+                store.close()
+
     async def test_untrusted_and_invalid_events_are_skipped_without_blocking_queue(self):
         now = datetime(2026, 10, 16, 12, tzinfo=timezone.utc).timestamp()
         with TemporaryDirectory() as folder:
@@ -345,8 +563,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             next_creation = CREATED.replace("#123456", "#123457")
             forwarded = MessageFwdHeader(date=datetime.fromtimestamp(now, timezone.utc),
                                          from_id=PeerUser(PUBLISHER_ID))
-            client = AsyncMock()
-            client.get_messages.return_value = [
+            client = mock_client()
+            client.get_messages.side_effect = [[
                 message(next_creation, message_id=102, from_id=PeerUser(123)),
                 message(forged_reply, message_id=103, from_id=PeerUser(123)),
                 message(forged_reply, message_id=104, from_id=PeerUser(123), fwd_from=forwarded),
@@ -354,7 +572,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 message(TEXT.replace("#123456", "#9223372036854775808"), message_id=106),
                 message(next_creation, message_id=107, date=datetime.fromtimestamp(now, timezone.utc)),
                 message(TEXT, message_id=108),
-            ]
+            ], []]
             stop = asyncio.Event()
 
             async def finish_poll(event, seconds):
@@ -398,7 +616,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                                       "author": "🙂" * 100, "title": "🙂" * 200}, now-25*3600)
                 store.confirm_sent(msg_id)
             stop = asyncio.Event()
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.return_value = []
             sent = 0
 
@@ -461,7 +679,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 stop.set()
                 return SENT
 
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.side_effect = read
             try:
                 with patch("relay.command_loop", side_effect=idle_commands), \
@@ -494,7 +712,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         raise RuntimeError("worker failed")
                     stop.set()
 
-                client = AsyncMock()
+                client = mock_client()
                 client.get_messages.side_effect = read
                 try:
                     with patch("relay.command_loop", side_effect=commands):
@@ -517,7 +735,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             store.process(101, {"kind": "created", "ticket_id": 1, "author": "Атлет", "title": "Вопрос"}, evening-25*3600)
             store.confirm_sent(101)
             stop = asyncio.Event()
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.return_value = []
 
             async def cross_boundary(seconds):
@@ -572,7 +790,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await paused.wait()
                 return [message(CREATED)]
 
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.side_effect = read
             polls = 0
             sent = []
@@ -614,11 +832,12 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                              "api_hash": "dummy", "bot_token": "dummy"})
             write_json(root / "state.json", {"route": CONFIG, "last_id": 3})
-            client = AsyncMock()
+            client = mock_client()
             client.is_user_authorized.return_value = True
             client.is_bot.return_value = False
             client.get_entity.return_value = SimpleNamespace(noforwards=False)
-            client.get_messages.side_effect = [[message(message_id=1000)], [message(CREATED, message_id=1020)]]
+            client.get_messages.side_effect = [[message(message_id=1000)],
+                                               [message(CREATED, message_id=1020)], []]
 
             async def stop_wait(stop, seconds):
                 stop.set()
@@ -658,7 +877,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 (root / "reader.session").touch()
                 write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                                  "api_hash": "dummy", "bot_token": "dummy"})
-                client = AsyncMock()
+                client = mock_client()
                 client.is_user_authorized.return_value = True
                 client.is_bot.return_value = False
                 client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -696,7 +915,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             (root / "reader.session").touch()
             write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                              "api_hash": "dummy", "bot_token": "dummy"})
-            client = AsyncMock()
+            client = mock_client()
             client.is_user_authorized.return_value = True
             client.is_bot.return_value = False
             client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -744,7 +963,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 event = {"kind": "created", "ticket_id": 123456, "author": "Тестовый Атлет", "title": "Вопрос"}
                 store.process(101, event, now-25*3600)
                 store.confirm_sent(101)
-                client = AsyncMock()
+                client = mock_client()
                 if offline:
                     client.get_messages.side_effect = OSError("offline")
                 else:
@@ -776,7 +995,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100, now=now-25*3600)
             store.process(101, {"kind": "created", "ticket_id": 1, "author": "Атлет", "title": "Вопрос"}, now-25*3600)
             store.confirm_sent(101)
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.return_value = []
             waits = 0
 
@@ -830,7 +1049,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 if seconds == 60:
                     stop.set()
 
-            client = AsyncMock()
+            client = mock_client()
             client.is_user_authorized.return_value = True
             client.is_bot.return_value = False
             client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -846,7 +1065,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(main(SimpleNamespace(command="run", non_interactive=True)), 2)
             self.assertEqual(events, [("read", 100), ("read", 200),
                                       ("send", 201), ("send", 299), ("read", 300),
-                                      ("send", 301), ("wait", 60)])
+                                      ("send", 301), ("read", 302), ("wait", 60)])
             self.assertEqual(stored_state(root / "tickets.sqlite3")["last_id"], 302)
             client.disconnect.assert_awaited_once()
 
@@ -880,7 +1099,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                     for item in history:
                         yield item
 
-                client = AsyncMock()
+                client = mock_client()
                 client.is_user_authorized.return_value = True
                 client.is_bot.return_value = False
                 client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -936,7 +1155,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 (root / "reader.session").touch()
                 write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                                  "api_hash": "dummy", "bot_token": "dummy"})
-                client = AsyncMock()
+                client = mock_client()
                 client.is_user_authorized.return_value = True
                 client.is_bot.return_value = False
                 client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -971,7 +1190,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             (local / "reader.session").touch()
             write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                              "api_hash": "dummy", "bot_token": "dummy"})
-            client = AsyncMock()
+            client = mock_client()
             client.is_user_authorized.return_value = True
             client.is_bot.return_value = False
             client.get_entity.return_value = SimpleNamespace(noforwards=False)
@@ -1003,7 +1222,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             (root / "reader.session").touch()
             write_json(root / "config.json", {**CONFIG, "api_id": 1234,
                                              "api_hash": "dummy", "bot_token": "dummy"})
-            client = AsyncMock()
+            client = mock_client()
             client.is_user_authorized.return_value = False
             with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
                  patch("telethon.TelegramClient", return_value=client), \
@@ -1066,7 +1285,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                 stop.set()
                 return True
 
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.side_effect = read
             try:
                 with patch("relay.command_loop", side_effect=idle_commands), \
@@ -1114,7 +1333,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                 stop.set()
                 return True
 
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.side_effect = read
             try:
                 self.assertEqual(store.pending_reactions(night), [{"ticket_id": 1, "destination_message_id": 900}])
@@ -1167,7 +1386,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                     failed.set()
                     raise error
 
-                client = AsyncMock()
+                client = mock_client()
                 client.get_messages.side_effect = read
                 try:
                     with patch("relay.command_loop", side_effect=commands), \
@@ -1214,7 +1433,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                 entered.set()
                 await asyncio.Event().wait()
 
-            client = AsyncMock()
+            client = mock_client()
             client.get_messages.side_effect = read
             try:
                 with patch("relay.command_loop", side_effect=idle_commands), \
@@ -1235,7 +1454,7 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(result=result), TemporaryDirectory() as folder:
                 path = Path(folder) / "tickets.sqlite3"
                 store = TicketStore(path, CONFIG, initial_id=100, now=self.now)
-                client = AsyncMock()
+                client = mock_client()
                 client.get_messages.return_value = [message(CREATED)]
                 try:
                     with patch("relay.command_loop", side_effect=idle_commands), \

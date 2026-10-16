@@ -426,6 +426,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 continue
             LOG.info("Источник ответил: получено новых сообщений — %s (до отбора по клубу).",
                      len(messages))
+            sent_cards = False
             for message in messages:
                 if stop.is_set():
                     break
@@ -447,10 +448,11 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                         raise RuntimeError("Telegram не подтвердил ID доставленной карточки; "
                                            "сначала нужна проверка и resolve.")
                     store.confirm_sent(message.id, target_id)
+                    sent_cards = True
                     print(f"Передано сообщение {message.id}.")
                 if event and event["kind"] == "reply":
                     reaction_ready.set()
-            if len(messages) == 100:
+            if len(messages) == 100 or sent_cards:
                 continue
             if stop.is_set():
                 break
@@ -485,10 +487,16 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                                                       stop, bot_call, enqueue_ack)),
              asyncio.create_task(acknowledge())]
     tasks.append(asyncio.create_task(react_to_handled()))
+    disconnected = client.disconnected  # Telethon защищает свою Future от отмены наблюдателя.
+    tasks.append(disconnected)
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        connection_lost = disconnected in done and not stop.is_set()
+        if connection_lost:
+            stop.set()
         for task in done:
-            task.result()
+            if task is not disconnected:
+                task.result()
         if stop.is_set():
             if store.state["pending_id"] is None and not reader.done():
                 reader.cancel()  # Ожидание чтения можно прервать без изменения позиции.
@@ -497,6 +505,9 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 await reader  # Сохранить результат начатой отправки нового тикета.
         elif reader not in done:
             raise RuntimeError("Одна из фоновых задач неожиданно остановилась.")
+        if connection_lost:
+            raise RuntimeError("Соединение с источником окончательно потеряно. "
+                               "Процесс завершён для перезапуска; подтверждённые отправки сохранены.")
     finally:
         for task in tasks:
             task.cancel()
