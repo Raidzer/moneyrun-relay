@@ -42,8 +42,13 @@ def parse_ticket_event(text):
         ("reply", r"Пользователь (.+?) написал в тикет #(\d+)"),
     ):
         match = re.fullmatch(pattern, header, flags=re.IGNORECASE)
-        if match and int(match[2]) > 0:
-            return {"kind": kind, "ticket_id": int(match[2]), "author": match[1],
+        if match:
+            try:
+                ticket_id = int(match[2])
+                _message_id(ticket_id)
+            except ValueError:
+                return None
+            return {"kind": kind, "ticket_id": ticket_id, "author": match[1],
                     "title": match[3] if kind == "created" else ""}
     return None
 

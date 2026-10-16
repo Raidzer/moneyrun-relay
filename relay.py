@@ -25,6 +25,7 @@ from jokes import JokeSource, append_joke, jokes_enabled
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
 LOG = logging.getLogger("moneyrun_relay")
+TRUSTED_PUBLISHER_ID = 265658465  # @FBR2BOT: ID сохраняется при смене username.
 ROUTE_KEYS = (
     "source_chat_id", "source_topic_id", "destination_chat_id",
     "destination_topic_id", "club_hashtag",
@@ -58,7 +59,8 @@ def topic_id(message):
 
 
 def selected(message, config):
-    if message.chat_id != config["source_chat_id"]:
+    if (message.chat_id != config["source_chat_id"]
+            or getattr(message, "sender_id", None) != TRUSTED_PUBLISHER_ID):
         return False
     topic = config.get("source_topic_id")
     if topic is not None and topic_id(message) != topic:

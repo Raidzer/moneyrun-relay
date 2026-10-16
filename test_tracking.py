@@ -38,6 +38,26 @@ class HeaderTests(unittest.TestCase):
         self.assertEqual(parse_ticket_event(text), created(author="АТЛЕТ Иван"))
         self.assertEqual(normalize_author("  АТЛЕТ\tИван  "), "атлет иван")
 
+    def test_ticket_id_boundary_and_decimal_forms_are_preserved(self):
+        for template, expected in (
+            ("Пользователь Атлет Иван создал новый тикет #{} - Не начислены XP", created),
+            ("Пользователь Забота написал в тикет #{}", reply),
+        ):
+            for number, ticket_id in ((str(2**63 - 1), 2**63 - 1), ("00042", 42),
+                                      ("٤٢", 42), ("４２", 42)):
+                with self.subTest(kind=expected.__name__, number=number):
+                    self.assertEqual(parse_ticket_event("#Club\n" + template.format(number)),
+                                     expected(ticket_id=ticket_id))
+
+    def test_zero_and_oversized_ticket_ids_are_not_events(self):
+        for template in (
+            "Пользователь Атлет Иван создал новый тикет #{} - Не начислены XP",
+            "Пользователь Забота написал в тикет #{}",
+        ):
+            for number in ("0", str(2**63), "9" * 100, "9" * 5000):
+                with self.subTest(template=template, digits=len(number)):
+                    self.assertIsNone(parse_ticket_event("#Club\n" + template.format(number)))
+
     def test_body_cannot_create_an_event(self):
         for text in (
             "#Club\n\nОбновление обращения\n\nПользователь Забота написал в тикет #42",
@@ -209,7 +229,8 @@ class StoreTests(StoreFixture):
         self.assertEqual(self.store.state["command_offset"], 0)
 
     def test_invalid_event_does_not_advance_cursor(self):
-        for event in (created(ticket_id=0), created(author=""), created(title=""),
+        for event in (created(ticket_id=0), created(ticket_id=2**63), reply(ticket_id=2**63),
+                      created(author=""), created(title=""),
                       {**reply(), "kind": "other"}):
             with self.subTest(event=event), self.assertRaises(ValueError):
                 self.store.process(101, event, 0)

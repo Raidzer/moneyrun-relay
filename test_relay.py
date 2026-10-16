@@ -12,7 +12,7 @@ from urllib.error import HTTPError
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from telethon.tl.types import (Message, MessageReplyHeader, PeerChannel,
+from telethon.tl.types import (Message, MessageReplyHeader, MessageFwdHeader, PeerChannel, PeerUser,
                               MessageEntityBold, MessageEntityTextUrl)
 from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
@@ -34,6 +34,7 @@ TEXT = ("#KhromushkinTeam\n\nПользователь Тестовый Атле�
 CREATED = TEXT.replace("написал в тикет #123456", "создал новый тикет #123456 - Вопрос")
 BOT = {"type": "group", "id": 1234, "username": "test_relay_bot", "status": "administrator"}
 SENT = {"message_id": 900}
+PUBLISHER_ID = 265658465
 REAL_SLEEP = asyncio.sleep
 
 
@@ -59,6 +60,7 @@ def stored_state(path):
 
 def message(text=TEXT, message_id=101, **fields):
     fields.setdefault("date", datetime.now(timezone.utc))
+    fields.setdefault("from_id", PeerUser(PUBLISHER_ID))
     return Message(id=message_id, peer_id=PeerChannel(1234567890), message=text, **fields)
 
 
@@ -148,6 +150,18 @@ class RelayTests(unittest.TestCase):
         self.assertTrue(selected(reply, config))
         self.assertFalse(selected(message(), config))
         self.assertTrue(selected(message(), {**config, "source_topic_id": 1}))
+
+    def test_only_actual_publisher_is_trusted(self):
+        forwarded = MessageFwdHeader(date=datetime.now(timezone.utc), from_id=PeerUser(PUBLISHER_ID))
+        for text in (CREATED, TEXT):
+            self.assertTrue(selected(message(text), CONFIG))
+            self.assertTrue(selected(message(text, fwd_from=forwarded), CONFIG))
+            for fields in ({"from_id": None}, {"from_id": PeerUser(123), "post_author": "FBR2BOT"},
+                           {"from_id": PeerChannel(PUBLISHER_ID)},
+                           {"from_id": PeerUser(123), "fwd_from": forwarded},
+                           {"from_id": PeerUser(123), "via_bot_id": PUBLISHER_ID}):
+                with self.subTest(text=text[:80], fields=fields):
+                    self.assertFalse(selected(message(text, **fields), CONFIG))
 
     def test_text_preserved_and_original_link(self):
         payload = message_payload(message(), {**CONFIG, "destination_topic_id": 73})
@@ -318,6 +332,62 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         env_patch = patch.dict("os.environ", {"JOKES_ENABLED": "false"})
         env_patch.start()
         self.addCleanup(env_patch.stop)
+
+    async def test_untrusted_and_invalid_events_are_skipped_without_blocking_queue(self):
+        now = datetime(2026, 10, 16, 12, tzinfo=timezone.utc).timestamp()
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "tickets.sqlite3"
+            store = TicketStore(path, CONFIG, initial_id=100, now=now)
+            store.process(101, {"kind": "created", "ticket_id": 123456,
+                                "author": "Тестовый Атлет", "title": "Вопрос"}, now)
+            store.confirm_sent(101, 899)
+            forged_reply = TEXT.replace("Тестовый Атлет", "Другой Человек")
+            next_creation = CREATED.replace("#123456", "#123457")
+            forwarded = MessageFwdHeader(date=datetime.fromtimestamp(now, timezone.utc),
+                                         from_id=PeerUser(PUBLISHER_ID))
+            client = AsyncMock()
+            client.get_messages.return_value = [
+                message(next_creation, message_id=102, from_id=PeerUser(123)),
+                message(forged_reply, message_id=103, from_id=PeerUser(123)),
+                message(forged_reply, message_id=104, from_id=PeerUser(123), fwd_from=forwarded),
+                message(forged_reply, message_id=105, from_id=PeerChannel(PUBLISHER_ID)),
+                message(TEXT.replace("#123456", "#9223372036854775808"), message_id=106),
+                message(next_creation, message_id=107, date=datetime.fromtimestamp(now, timezone.utc)),
+                message(TEXT, message_id=108),
+            ]
+            stop = asyncio.Event()
+
+            async def finish_poll(event, seconds):
+                event.set()
+
+            try:
+                with patch("relay.command_loop", side_effect=idle_commands), \
+                     patch("relay.bot_call", return_value=SENT) as api, \
+                     patch("relay.asyncio.sleep", side_effect=no_delay), \
+                     patch("relay.wait_or_stop", side_effect=finish_poll), \
+                     patch("relay.time.time", return_value=now), patch("relay.LOG") as log, \
+                     patch("builtins.print"):
+                    await asyncio.wait_for(run_tracking(client, object(), CONFIG, store, stop, 15,
+                                                        {"interval": 14400, "start": 1380, "end": 540},
+                                                        "dummy", BOT), 2)
+                api.assert_awaited_once()
+                self.assertEqual(api.await_args.args[1], "sendMessage")
+                self.assertEqual(api.await_args.args[2]["text"], next_creation)
+                log.warning.assert_called_once_with(
+                    "Не распознан заголовок уведомления %s; состояние тикетов не изменено.", 106)
+                self.assertEqual(store.pending_reactions(now), [])
+                self.assertIsNone(store.state["pending_id"])
+            finally:
+                store.close()
+            restored = TicketStore(path, CONFIG)
+            try:
+                self.assertEqual(restored.state["last_id"], 108)
+                self.assertEqual([ticket["ticket_id"] for ticket in restored.pending_tickets()],
+                                 [123456, 123457])
+                self.assertEqual(restored.pending_tickets()[0]["author"], "Тестовый Атлет")
+                self.assertEqual(restored.pending_reactions(now), [])
+            finally:
+                restored.close()
 
     async def test_rate_limit_after_first_summary_part_does_not_repeat_delivered_tickets(self):
         now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
@@ -794,7 +864,11 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 write_json(root / "state.json", {"route": config, "last_id": 999, "pending_id": None})
                 original = (root / "state.json").read_bytes()
                 reply = MessageReplyHeader(reply_to_msg_id=50, forum_topic=True)
-                history = [message(message_id=110),  # Другой топик.
+                history = [message(message_id=112, reply_to=reply, from_id=PeerUser(123)),
+                           message(message_id=111, reply_to=reply, from_id=PeerUser(123),
+                                   fwd_from=MessageFwdHeader(date=datetime.now(timezone.utc),
+                                                            from_id=PeerUser(PUBLISHER_ID))),
+                           message(message_id=110),  # Другой топик.
                            message("#OtherClub\ntext", message_id=109, reply_to=reply)]
                 if mode != "empty":
                     history += [message(message_id=i, reply_to=reply, entities=[ticket_link],
