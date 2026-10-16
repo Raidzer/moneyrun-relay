@@ -4,6 +4,7 @@ import asyncio
 from html.parser import HTMLParser
 from http.client import HTTPException
 import logging
+import os
 import random
 import time
 from urllib.request import Request, urlopen
@@ -17,6 +18,13 @@ MAX_FEED_BYTES = 512 * 1024
 CACHE_SECONDS = 60 * 60
 RETRY_SECONDS = 5 * 60
 LOG = logging.getLogger("moneyrun_relay")
+
+
+def jokes_enabled() -> bool:
+    value = os.environ.get("JOKES_ENABLED", "false").strip().casefold()
+    if value not in ("true", "false"):
+        raise ValueError("JOKES_ENABLED: допустимые значения — true или false.")
+    return value == "true"
 
 
 class _PlainText(HTMLParser):

@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from tracking import TicketStore, parse_ticket_event
 from commands import command_loop
-from jokes import JokeSource, append_joke
+from jokes import JokeSource, append_joke, jokes_enabled
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -70,8 +70,20 @@ def selected(message, config):
 
 
 def message_payload(message, config):
+    from telethon.tl.types import MessageEntityTextUrl
+
     payload = {"chat_id": config["destination_chat_id"], "text": message.raw_text,
                "link_preview_options": {"is_disabled": True}}
+    text_length = len((message.raw_text or "").encode("utf-16-le")) // 2
+    links = [{"type": "text_link", "offset": entity.offset,
+              "length": entity.length, "url": entity.url}
+             for entity in (getattr(message, "entities", None) or [])
+             if isinstance(entity, MessageEntityTextUrl)
+             and isinstance(entity.url, str) and entity.url
+             and type(entity.offset) is int and type(entity.length) is int
+             and 0 <= entity.offset < entity.offset + entity.length <= text_length]
+    if links:
+        payload["entities"] = links
     if config.get("destination_topic_id") is not None:
         payload["message_thread_id"] = config["destination_topic_id"]
     source = str(config["source_chat_id"])
@@ -314,12 +326,13 @@ async def bot_call(token, method, payload, *, allowed=None, wait_on_rate_limit=T
                            "Проверь токен, ID группы/топика и право бота отправлять сообщения.")
 
 
-async def run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot):
+async def run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot,
+                       *, use_jokes=False):
     from telethon.errors import FloodWaitError
 
     send_lock, acknowledgements = asyncio.Lock(), asyncio.Queue(maxsize=100)
     reaction_ready = asyncio.Event()
-    joke_source = JokeSource()
+    joke_source = JokeSource() if use_jokes else None
     last_send = 0.0
 
     async def send(payload, *, reminder=False, regular=False, before_send=None, reaction=False):
@@ -424,7 +437,8 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 created_at = message.date.timestamp() if event else 0
                 if store.process(message.id, event, created_at):
                     payload = message_payload(message, config)
-                    payload["text"] = append_joke(payload["text"], await joke_source.choose())
+                    if joke_source is not None:
+                        payload["text"] = append_joke(payload["text"], await joke_source.choose())
                     delivery = await send(payload)
                     target_id = delivery.get("message_id") if isinstance(delivery, dict) else None
                     if type(target_id) is not int or target_id <= 0:
@@ -551,6 +565,7 @@ async def main(args):
     if args.command == "run":
         poll_interval = poll_interval_seconds()
         settings = reminder_settings()
+        use_jokes = jokes_enabled()
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: stop.set())
     api_id = int(config.get("api_id") or input("API ID с my.telegram.org: "))
@@ -614,7 +629,9 @@ async def main(args):
               f"Тихие часы: {settings['start'] // 60:02}:{settings['start'] % 60:02}–"
               f"{settings['end'] // 60:02}:{settings['end'] % 60:02} по Москве. "
               f"Ручная пауза: {'включена' if store.state['paused'] else 'выключена'}.")
-        await run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot)
+        print(f"Анекдоты: {'включены' if use_jokes else 'выключены'}.")
+        await run_tracking(client, source, config, store, stop, poll_interval, settings, token, bot,
+                           use_jokes=use_jokes)
     finally:
         try:
             await client.disconnect()

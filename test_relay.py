@@ -12,7 +12,8 @@ from urllib.error import HTTPError
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from telethon.tl.types import Message, MessageReplyHeader, PeerChannel
+from telethon.tl.types import (Message, MessageReplyHeader, PeerChannel,
+                              MessageEntityBold, MessageEntityTextUrl)
 from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
                    poll_interval_seconds, read_state, resolve_pending, selected,
@@ -152,9 +153,40 @@ class RelayTests(unittest.TestCase):
         payload = message_payload(message(), {**CONFIG, "destination_topic_id": 73})
         self.assertEqual(payload["text"], TEXT)
         self.assertNotIn("parse_mode", payload)
+        self.assertNotIn("entities", payload)
         self.assertEqual(payload["message_thread_id"], 73)
         self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["url"],
                          "https://t.me/c/1234567890/101")
+
+    def test_author_and_ticket_links_keep_utf16_offsets(self):
+        author = "Иван 🙂 & Пётр"
+        text = CREATED.replace("Тестовый Атлет", author)
+        links = []
+        expected = []
+        for label, url in ((author, "https://example.test/users/42?from=tg&mode=care"),
+                           ("#123456", "https://example.test/tickets/123456")):
+            offset = len(text[:text.index(label)].encode("utf-16-le")) // 2
+            length = len(label.encode("utf-16-le")) // 2
+            links.append(MessageEntityTextUrl(offset, length, url))
+            expected.append({"type": "text_link", "offset": offset, "length": length, "url": url})
+        payload = message_payload(message(text, entities=links), CONFIG)
+        self.assertEqual(payload["text"], text)
+        self.assertEqual(payload["entities"], expected)
+        self.assertNotIn("parse_mode", payload)
+        self.assertGreater(expected[1]["offset"], text.index("#123456"))
+        for entity, label in zip(payload["entities"], (author, "#123456")):
+            start = entity["offset"] * 2
+            end = start + entity["length"] * 2
+            self.assertEqual(payload["text"].encode("utf-16-le")[start:end].decode("utf-16-le"), label)
+
+    def test_unknown_or_invalid_link_entities_are_skipped(self):
+        invalid = [MessageEntityBold(0, 4)]
+        for offset, length, url in ((-1, 2, "https://example.test/"), (0, 0, "https://example.test/"),
+                                    (0, len(TEXT.encode("utf-16-le")) // 2 + 1, "https://example.test/"),
+                                    (0, 4, ""),
+                                    (True, 4, "https://example.test/")):
+            invalid.append(MessageEntityTextUrl(offset, length, url))
+        self.assertNotIn("entities", message_payload(message(entities=invalid), CONFIG))
 
     def test_send_and_restart_do_not_repeat(self):
         with TemporaryDirectory() as folder:
@@ -283,6 +315,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         joke_patch = patch("relay.JokeSource.choose", self.joke_choice)
         joke_patch.start()
         self.addCleanup(joke_patch.stop)
+        env_patch = patch.dict("os.environ", {"JOKES_ENABLED": "false"})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
 
     async def test_rate_limit_after_first_summary_part_does_not_repeat_delivered_tickets(self):
         now = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
@@ -544,6 +579,34 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(store.state["last_id"], 1030)
             finally:
                 store.close()
+            self.joke_choice.assert_not_awaited()
+
+    async def test_global_joke_setting_reaches_worker_and_invalid_value_fails_before_connect(self):
+        for value, expected in (("false", False), ("true", True), ("wrong", None)):
+            with self.subTest(value=value), TemporaryDirectory() as folder:
+                root = Path(folder)
+                (root / "reader.session").touch()
+                write_json(root / "config.json", {**CONFIG, "api_id": 1234,
+                                                 "api_hash": "dummy", "bot_token": "dummy"})
+                client = AsyncMock()
+                client.is_user_authorized.return_value = True
+                client.is_bot.return_value = False
+                client.get_entity.return_value = SimpleNamespace(noforwards=False)
+                client.get_messages.return_value = []
+                with patch("relay.ROOT", root), patch("relay.LOCAL", root), \
+                     patch.dict("os.environ", {"JOKES_ENABLED": value}), \
+                     patch("telethon.TelegramClient", return_value=client) as factory, \
+                     patch("relay.bot_call", return_value=BOT), patch("relay.signal.signal"), \
+                     patch("relay.run_tracking", new_callable=AsyncMock) as worker, patch("builtins.print"):
+                    if expected is None:
+                        with self.assertRaisesRegex(ValueError, "JOKES_ENABLED"):
+                            await main(SimpleNamespace(command="run", non_interactive=True))
+                        factory.assert_not_called()
+                        worker.assert_not_awaited()
+                    else:
+                        await main(SimpleNamespace(command="run", non_interactive=True))
+                        worker.assert_awaited_once()
+                        self.assertEqual(worker.await_args.kwargs, {"use_jokes": expected})
 
     async def test_disappeared_tracking_database_does_not_bootstrap_again(self):
         with TemporaryDirectory() as folder:
@@ -718,6 +781,9 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
             client.disconnect.assert_awaited_once()
 
     async def test_recent_preview_send_failure_and_protection_keep_live_state(self):
+        ticket_offset = len(TEXT[:TEXT.index("#123456")].encode("utf-16-le")) // 2
+        ticket_url = "https://example.test/tickets/123456"
+        ticket_link = MessageEntityTextUrl(ticket_offset, 7, ticket_url)
         for mode in ("preview", "send", "failure", "protected", "empty"):
             with self.subTest(mode=mode), TemporaryDirectory() as folder:
                 root = Path(folder)
@@ -731,7 +797,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                 history = [message(message_id=110),  # Другой топик.
                            message("#OtherClub\ntext", message_id=109, reply_to=reply)]
                 if mode != "empty":
-                    history += [message(message_id=i, reply_to=reply,
+                    history += [message(message_id=i, reply_to=reply, entities=[ticket_link],
                                         noforwards=(mode == "protected" and i == 103))
                                 for i in (104, 103, 102, 101)]
 
@@ -783,6 +849,8 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(payload["chat_id"], config["destination_chat_id"])
                         self.assertEqual(payload["message_thread_id"], 73)
                         self.assertEqual(payload["text"], TEXT)
+                        self.assertEqual(payload["entities"], [{"type": "text_link", "offset": ticket_offset,
+                                                               "length": 7, "url": ticket_url}])
                         self.assertTrue(payload["reply_markup"]["inline_keyboard"][0][0]["url"].endswith(f"/{msg_id}"))
         self.joke_choice.assert_not_awaited()
 
@@ -885,6 +953,8 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_first_other_reply_reacts_once_to_delivered_card_without_forwarding_replies(self):
         self.joke_choice.return_value = "Тестовый анекдот."
+        ticket_offset = len(CREATED[:CREATED.index("#123456")].encode("utf-16-le")) // 2
+        ticket_url = "https://example.test/tickets/123456"
         config = {**CONFIG, "destination_topic_id": 73}
         with TemporaryDirectory() as folder:
             store = TicketStore(Path(folder) / "tickets.sqlite3", config, initial_id=100, now=self.now)
@@ -899,7 +969,9 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                 nonlocal reads
                 reads += 1
                 if reads == 1:
-                    return [message(CREATED, message_id=102), message(TEXT, message_id=103)]
+                    return [message(CREATED, message_id=102,
+                                    entities=[MessageEntityTextUrl(ticket_offset, 7, ticket_url)]),
+                            message(TEXT, message_id=103)]
                 if reads == 2:
                     self.assertEqual(store.pending_reactions(self.now), [])
                     self.assertEqual(len(store.pending_tickets()), 2)
@@ -928,11 +1000,13 @@ class ReactionTests(unittest.IsolatedAsyncioTestCase):
                      patch("relay.wait_or_stop", side_effect=skip_poll_delay), \
                      patch("relay.time.time", return_value=self.now), patch("builtins.print"):
                     await asyncio.wait_for(run_tracking(client, object(), config, store, stop, 60,
-                                                        self.settings, "dummy", BOT), 2)
+                                                        self.settings, "dummy", BOT, use_jokes=True), 2)
                 self.assertEqual([method for method, _ in calls], ["sendMessage", "setMessageReaction"])
                 self.assertEqual(calls[0][1]["text"], CREATED + "\n\n────────────\n😄 Анекдот\n"
                                  "Тестовый анекдот.\n\nИсточник: https://www.anekdot.ru/")
                 self.assertEqual(calls[0][1]["message_thread_id"], 73)
+                self.assertEqual(calls[0][1]["entities"], [{"type": "text_link", "offset": ticket_offset,
+                                                          "length": 7, "url": ticket_url}])
                 self.assertTrue(calls[0][1]["reply_markup"]["inline_keyboard"][0][0]["url"].endswith("/102"))
                 self.joke_choice.assert_awaited_once()
                 self.assertEqual(store.state["last_id"], 106)

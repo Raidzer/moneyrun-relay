@@ -2,16 +2,35 @@
 
 import asyncio
 from http.client import IncompleteRead
+import os
 from urllib.error import HTTPError, URLError
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from xml.etree import ElementTree
 
 from jokes import (CACHE_SECONDS, FETCH_TIMEOUT, FEED_URL, JokeSource, MAX_FEED_BYTES,
-                   RETRY_SECONDS, SOURCE_URL, _fetch_jokes, append_joke)
+                   RETRY_SECONDS, SOURCE_URL, _fetch_jokes, append_joke, jokes_enabled)
 
 
 REAL_TO_THREAD = asyncio.to_thread
+
+
+class EnabledTests(unittest.TestCase):
+    def test_default_is_false(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(jokes_enabled())
+
+    def test_true_and_false_ignore_case_and_surrounding_whitespace(self):
+        for value, expected in (("true", True), (" TrUe\t", True),
+                                ("false", False), ("\nFaLsE ", False)):
+            with self.subTest(value=value), patch.dict(os.environ, {"JOKES_ENABLED": value}):
+                self.assertIs(jokes_enabled(), expected)
+
+    def test_empty_and_invalid_values_are_rejected(self):
+        for value in ("", " \t", "1", "yes", "true false"):
+            with self.subTest(value=value), patch.dict(os.environ, {"JOKES_ENABLED": value}):
+                with self.assertRaisesRegex(ValueError, "JOKES_ENABLED.*true.*false"):
+                    jokes_enabled()
 
 
 def rss(*descriptions, encoding="utf-8"):
