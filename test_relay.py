@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from http.client import IncompleteRead
 import json
+import os
 from pathlib import Path
 import signal
 import sqlite3
@@ -19,7 +20,8 @@ from telethon.errors import FloodWaitError
 from relay import (check_unattended_config, main, message_payload, process_message,
                    poll_interval_seconds, read_state, resolve_pending, selected,
                    single_instance, validate_config, write_json, reminder_settings,
-                   quiet_hours, reminder_payloads, run_tracking, bot_call, bot_request, BotRateLimitError)
+                   quiet_hours, reminder_payloads, run_tracking, bot_call, bot_request, BotRateLimitError,
+                   ROUTE_KEYS)
 from tracking import TicketStore
 
 
@@ -337,7 +339,10 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         joke_patch = patch("relay.JokeSource.choose", self.joke_choice)
         joke_patch.start()
         self.addCleanup(joke_patch.stop)
-        env_patch = patch.dict("os.environ", {"JOKES_ENABLED": "false"})
+        env = os.environ.copy()
+        for key in ("api_id", "api_hash", "bot_token", *ROUTE_KEYS):
+            env.pop(key.upper(), None)
+        env_patch = patch.dict("os.environ", {**env, "JOKES_ENABLED": "false"}, clear=True)
         env_patch.start()
         self.addCleanup(env_patch.stop)
 

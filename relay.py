@@ -32,6 +32,30 @@ ROUTE_KEYS = (
 )
 
 
+def load_config():
+    path = ROOT / "config.json"
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+    except json.JSONDecodeError:
+        raise ValueError("config.json: некорректный JSON настроек.") from None
+    if not isinstance(config, dict):
+        raise ValueError("config.json: нужен JSON-объект настроек.")
+    for key in ("api_id", "api_hash", "bot_token", *ROUTE_KEYS):
+        name = key.upper()
+        if name not in os.environ:
+            continue
+        value = os.environ[name].strip()
+        if key.endswith("_id"):
+            try:
+                value = int(value) if value else None
+            except ValueError:
+                raise ValueError(f"{name}: нужно целое число.") from None
+            if key == "api_id" and value is not None and value <= 0:
+                raise ValueError("API_ID: нужно положительное целое число.")
+        config[key] = value
+    return config
+
+
 def validate_config(config, sending=False):
     source = config.get("source_chat_id")
     if type(source) is not int or source >= 0:
@@ -278,7 +302,8 @@ def check_unattended_config(config, command):
         required.append("bot_token")
     missing = [key for key in required if not config.get(key)]
     if missing:
-        raise ValueError("Для запуска без терминала заполни config.json: " + ", ".join(missing))
+        raise ValueError("Для запуска без терминала задай переменные окружения "
+                         "или заполни config.json: " + ", ".join(missing))
     if not (LOCAL / "reader.session").is_file():
         raise ValueError("Нет .local/reader.session. Сначала выполни вход локально "
                          "и перенеси сохранённую сессию в папку данных контейнера.")
@@ -544,10 +569,7 @@ def single_instance():
 async def main(args):
     from telethon import TelegramClient
 
-    path = ROOT / "config.json"
-    if not path.exists():
-        raise ValueError("Сначала скопируй config.example.json в config.json.")
-    config = json.loads(path.read_text(encoding="utf-8-sig"))
+    config = load_config()
     if args.command != "chats":
         validate_config(config, sending=args.command in ("run", "resolve", "test"))
     route = {key: config.get(key) for key in ROUTE_KEYS}

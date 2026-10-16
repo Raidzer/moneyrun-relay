@@ -7,6 +7,14 @@ services:
     init: true
     stop_grace_period: 60s
     environment:
+      API_ID: "${API_ID:-}"
+      API_HASH: "${API_HASH:-}"
+      BOT_TOKEN: "${BOT_TOKEN:-}"
+      SOURCE_CHAT_ID: "${SOURCE_CHAT_ID:-}"
+      SOURCE_TOPIC_ID: "${SOURCE_TOPIC_ID:-}"
+      DESTINATION_CHAT_ID: "${DESTINATION_CHAT_ID:-}"
+      DESTINATION_TOPIC_ID: "${DESTINATION_TOPIC_ID:-}"
+      CLUB_HASHTAG: "${CLUB_HASHTAG:-}"
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-15}
       REMINDER_INTERVAL_HOURS: ${REMINDER_INTERVAL_HOURS:-4}
       QUIET_HOURS_START: ${QUIET_HOURS_START:-23:00}
@@ -18,12 +26,6 @@ services:
     security_opt:
       - no-new-privileges:true
     volumes:
-      - type: bind
-        source: ${RELAY_DIR:-/share/Container/moneyrun-relay}/config.json
-        target: /app/config.json
-        read_only: true
-        bind:
-          create_host_path: false
       - type: bind
         source: ${RELAY_DIR:-/share/Container/moneyrun-relay}/Local
         target: /app/.local
