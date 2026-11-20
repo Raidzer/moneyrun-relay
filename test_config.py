@@ -123,6 +123,30 @@ class ConfigTests(ConfigFixture, unittest.TestCase):
 
 
 class ConfigLifecycleTests(ConfigFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_proxy_is_passed_to_telethon(self):
+        client = AsyncMock()
+        client.is_bot.return_value = False
+        client.get_messages.return_value = []
+        with patch.dict("os.environ", {**ENV, "TELEGRAM_PROXY": " http://proxy.example:7890 "}), \
+             patch.object(telethon, "TelegramClient", return_value=client) as factory, \
+             patch("builtins.print"):
+            await relay.main(SimpleNamespace(command="preview", non_interactive=False))
+        factory.assert_called_once_with(str(self.local / "reader"), 1234, "dummy-hash",
+                                        receive_updates=False, proxy=("http", "proxy.example", 7890))
+        client.start.assert_awaited_once()
+
+    async def test_invalid_telegram_proxy_stops_before_connecting_without_echoing_value(self):
+        for value in ("socks5://proxy.example:7890", "http://proxy.example",
+                      "http://proxy.example:0", "http://proxy.example:65536",
+                      "http://user:secret@proxy.example:7890", "http://proxy.example:7890/path"):
+            with self.subTest(value=value), patch.dict("os.environ", {**ENV, "TELEGRAM_PROXY": value}), \
+                 patch.object(telethon, "TelegramClient") as factory:
+                with self.assertRaisesRegex(ValueError, "TELEGRAM_PROXY") as caught:
+                    await relay.main(SimpleNamespace(command="preview", non_interactive=False))
+                self.assertNotIn(value, str(caught.exception))
+                self.assertNotIn("secret", str(caught.exception))
+                factory.assert_not_called()
+
     async def test_missing_unattended_values_fail_before_client_or_prompts(self):
         (self.local / "reader.session").touch()
         with patch.object(telethon, "TelegramClient") as factory, patch("builtins.input") as prompt, \
@@ -173,7 +197,7 @@ class ConfigLifecycleTests(ConfigFixture, unittest.IsolatedAsyncioTestCase):
              patch("relay.signal.signal"), patch("builtins.print"):
             await relay.main(SimpleNamespace(command="run", non_interactive=True))
             factory.assert_called_once_with(str(self.local / "reader"), 1234, "dummy-hash",
-                                            receive_updates=False)
+                                            receive_updates=False, proxy=None)
             worker.assert_awaited_once()
             self.assertEqual(worker.await_args.args[2], config)
         client.connect.assert_awaited_once()

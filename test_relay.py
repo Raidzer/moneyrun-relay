@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 from http.client import IncompleteRead
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -75,6 +76,20 @@ def message(text=TEXT, message_id=101, **fields):
 
 
 class RelayTests(unittest.TestCase):
+    def test_bot_api_tunnels_through_configured_proxy(self):
+        socket = MagicMock()
+        socket.makefile.return_value = BytesIO(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        with patch.dict(os.environ, {"TELEGRAM_PROXY": "http://proxy.example:7890", "NO_PROXY": "*"}), \
+             patch("socket.create_connection", return_value=socket) as connect:
+            with self.assertRaisesRegex(RuntimeError, "Telegram Bot API") as caught:
+                bot_request("secret", "getMe", {})
+        connect.assert_called_once()
+        self.assertEqual(connect.call_args.args[0], ("proxy.example", 7890))
+        handshake = socket.sendall.call_args.args[0]
+        self.assertTrue(handshake.startswith(b"CONNECT api.telegram.org:443 HTTP/"))
+        self.assertNotIn(b"secret", handshake)
+        self.assertNotIn("secret", str(caught.exception))
+
     def test_interrupted_http_body_becomes_sanitized_retryable_error(self):
         for http_error in (False, True):
             with self.subTest(http_error=http_error):

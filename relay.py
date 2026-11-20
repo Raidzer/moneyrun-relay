@@ -15,7 +15,8 @@ import signal
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from uuid import uuid4
 
 from tracking import TicketStore, parse_ticket_event
@@ -73,6 +74,21 @@ def validate_config(config, sending=False):
             raise ValueError("Нужно указать отрицательный destination_chat_id.")
         if source == target:
             raise ValueError("Источник и получатель должны быть разными группами.")
+
+
+def telegram_proxy():
+    value = os.getenv("TELEGRAM_PROXY", "").strip()
+    if not value:
+        return None
+    try:
+        proxy = urlsplit(value)
+        if (proxy.scheme == "http" and proxy.hostname and proxy.port
+                and proxy.username is None and proxy.path in ("", "/")
+                and not re.search(r"[\s\x00-\x1f\x7f\\?#]", value)):
+            return proxy
+    except ValueError:
+        pass
+    raise ValueError("TELEGRAM_PROXY: нужен адрес http://host:port без логина и пароля.")
 
 
 def topic_id(message):
@@ -309,14 +325,25 @@ def check_unattended_config(config, command):
                          "и перенеси сохранённую сессию в папку данных контейнера.")
 
 
+class TelegramProxyHandler(ProxyHandler):
+    def proxy_open(self, request, address, _scheme):
+        # Явный прокси Telegram применяется независимо от NO_PROXY.
+        request.set_proxy(address, "http")
+
+
 def bot_request(token, method, payload):
     request = Request(
         f"https://api.telegram.org/bot{token}/{method}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
+    proxy = telegram_proxy()
+    open_request = urlopen
+    if proxy:
+        handler = TelegramProxyHandler({"http": proxy.netloc, "https": proxy.netloc})
+        open_request = build_opener(handler).open
     try:
-        with urlopen(request, timeout=40) as response:
+        with open_request(request, timeout=40) as response:
             return json.load(response)
     except HTTPError as error:
         # Не выводим URL исключения: он содержит токен.
@@ -592,6 +619,7 @@ async def main(args):
             resolve_pending(state_path, route, args.message_id, args.result)
         print("Результат проверки сохранён. Можно запускать пересылку.")
         return
+    proxy = telegram_proxy()
     if args.command == "run" and not store_path.exists():
         read_state(state_path, route)  # Сначала разрешить старую неподтверждённую отправку.
     if args.non_interactive:
@@ -605,7 +633,8 @@ async def main(args):
             signal.signal(sig, lambda *_: stop.set())
     api_id = int(config.get("api_id") or input("API ID с my.telegram.org: "))
     api_hash = config.get("api_hash") or getpass("API hash (ввод скрыт): ")
-    client = TelegramClient(str(LOCAL / "reader"), api_id, api_hash, receive_updates=False)
+    client = TelegramClient(str(LOCAL / "reader"), api_id, api_hash, receive_updates=False,
+                            proxy=("http", proxy.hostname, proxy.port) if proxy else None)
     store = None
     try:
         if args.command == "run" and store_path.exists():

@@ -10,6 +10,7 @@ services:
       API_ID: "${API_ID:-}"
       API_HASH: "${API_HASH:-}"
       BOT_TOKEN: "${BOT_TOKEN:-}"
+      TELEGRAM_PROXY: "${TELEGRAM_PROXY:-}"
       SOURCE_CHAT_ID: "${SOURCE_CHAT_ID:-}"
       SOURCE_TOPIC_ID: "${SOURCE_TOPIC_ID:-}"
       DESTINATION_CHAT_ID: "${DESTINATION_CHAT_ID:-}"
