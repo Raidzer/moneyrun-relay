@@ -22,6 +22,7 @@ from uuid import uuid4
 from tracking import TicketStore, parse_ticket_event
 from commands import command_loop
 from jokes import JokeSource, append_joke, jokes_enabled
+from ai_recommend import RecommendationSource, append_recommendation
 
 ROOT = Path(__file__).resolve().parent
 LOCAL = ROOT / ".local"
@@ -111,12 +112,14 @@ def selected(message, config):
     return first_line.casefold() == config["club_hashtag"].casefold()
 
 
-def message_payload(message, config):
+def message_payload(message, config, recommendation=None):
     from telethon.tl.types import MessageEntityTextUrl
 
-    payload = {"chat_id": config["destination_chat_id"], "text": message.raw_text,
+    original_text = message.raw_text or ""
+    payload = {"chat_id": config["destination_chat_id"],
+               "text": append_recommendation(original_text, recommendation),
                "link_preview_options": {"is_disabled": True}}
-    text_length = len((message.raw_text or "").encode("utf-16-le")) // 2
+    text_length = len(original_text.encode("utf-16-le")) // 2
     links = [{"type": "text_link", "offset": entity.offset,
               "length": entity.length, "url": entity.url}
              for entity in (getattr(message, "entities", None) or [])
@@ -387,6 +390,9 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
     send_lock, acknowledgements = asyncio.Lock(), asyncio.Queue(maxsize=100)
     reaction_ready = asyncio.Event()
     joke_source = JokeSource() if use_jokes else None
+    recommender = RecommendationSource.from_env(LOCAL)
+    refresh_task = (asyncio.create_task(recommender.schedule_refresh(stop))
+                    if recommender else None)
     last_send = 0.0
 
     async def send(payload, *, reminder=False, regular=False, before_send=None, reaction=False):
@@ -491,7 +497,10 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                     raise RuntimeError("У сообщения включена защита содержимого; обработка остановлена.")
                 created_at = message.date.timestamp() if event else 0
                 if store.process(message.id, event, created_at):
-                    payload = message_payload(message, config)
+                    recommendation = None
+                    if event and event["kind"] == "created" and recommender:
+                        recommendation = await recommender.recommend(message.raw_text or "")
+                    payload = message_payload(message, config, recommendation)
                     if joke_source is not None:
                         payload["text"] = append_joke(payload["text"], await joke_source.choose())
                     delivery = await send(payload)
@@ -539,6 +548,8 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                                                       stop, bot_call, enqueue_ack)),
              asyncio.create_task(acknowledge())]
     tasks.append(asyncio.create_task(react_to_handled()))
+    if refresh_task is not None:
+        tasks.append(refresh_task)
     disconnected = client.disconnected  # Telethon защищает свою Future от отмены наблюдателя.
     tasks.append(disconnected)
     try:
@@ -597,6 +608,14 @@ async def main(args):
     from telethon import TelegramClient
 
     config = load_config()
+    if args.command == "ai-test":
+        recommender = RecommendationSource.from_env(LOCAL)
+        if recommender is None:
+            raise ValueError("ИИ API не настроен. Задай AI_RECOMMENDATIONS_ENABLED=true, "
+                             "AI_API_BASE_URL, AI_API_KEY и AI_MODEL.")
+        await recommender.probe()
+        print("Проверка ИИ API успешна. Синтетический запрос обработан.")
+        return
     if args.command != "chats":
         validate_config(config, sending=args.command in ("run", "resolve", "test"))
     route = {key: config.get(key) for key in ROUTE_KEYS}
@@ -710,9 +729,10 @@ if __name__ == "__main__":
     logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")
     LOG.setLevel(logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("chats", "preview", "run", "resolve", "test"),
+    parser.add_argument("command", choices=("chats", "preview", "run", "resolve", "test", "ai-test"),
                         help="chats — ID групп; preview — просмотр; run — пересылка; "
-                             "resolve — проверка отправки; test — последние сообщения клуба")
+                             "resolve — проверка отправки; test — последние сообщения клуба; "
+                             "ai-test — проверка ИИ синтетическим запросом")
     parser.add_argument("--count", type=int, choices=(1, 2, 3), default=3,
                         help="Число сообщений для test (по умолчанию 3)")
     parser.add_argument("--send", action="store_true", help="Отправить сообщения в режиме test")

@@ -21,6 +21,10 @@ services:
       QUIET_HOURS_START: ${QUIET_HOURS_START:-23:00}
       QUIET_HOURS_END: ${QUIET_HOURS_END:-09:00}
       JOKES_ENABLED: "${JOKES_ENABLED:-false}"
+      AI_RECOMMENDATIONS_ENABLED: "${AI_RECOMMENDATIONS_ENABLED:-false}"
+      AI_API_BASE_URL: "${AI_API_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
     read_only: true
     cap_drop:
       - ALL

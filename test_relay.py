@@ -197,6 +197,20 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["url"],
                          "https://t.me/c/1234567890/101")
 
+    def test_recommendation_is_appended_without_shifting_original_links(self):
+        author = "Иван 🙂"
+        text = CREATED.replace("Тестовый Атлет", author)
+        offset = len(text[:text.index(author)].encode("utf-16-le")) // 2
+        length = len(author.encode("utf-16-le")) // 2
+        payload = message_payload(
+            message(text, entities=[MessageEntityTextUrl(offset, length, "https://example.test/user")]),
+            CONFIG, "Что проверить\n- сверить ЧССМ",
+        )
+        self.assertIn("⚠️ ИИ-рекомендация, может содержать ошибки", payload["text"])
+        self.assertTrue(payload["text"].endswith("- сверить ЧССМ"))
+        self.assertEqual(payload["entities"], [{"type": "text_link", "offset": offset,
+                                                 "length": length, "url": "https://example.test/user"}])
+
     def test_author_and_ticket_links_keep_utf16_offsets(self):
         author = "Иван 🙂 & Пётр"
         text = CREATED.replace("Тестовый Атлет", author)
