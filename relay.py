@@ -741,8 +741,11 @@ if __name__ == "__main__":
     parser.add_argument("--result", choices=("sent", "retry"), help="Результат ручной проверки для resolve")
     args = parser.parse_args()
     try:
-        with single_instance():
+        if args.command == "ai-test":
             asyncio.run(main(args))
+        else:
+            with single_instance():
+                asyncio.run(main(args))
     except KeyboardInterrupt:
         print("\nОстановлено.")
     except (ValueError, RuntimeError) as error:
