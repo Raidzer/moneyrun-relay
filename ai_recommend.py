@@ -30,7 +30,8 @@ LOG = logging.getLogger("moneyrun_relay")
 SHEET_URL = ("https://docs.google.com/spreadsheets/d/"
              "1yUk0bjvjCVKQlPShM1vMoEHkvcXzLYCAd34bKMpjlDc/export?format=xlsx")
 GUIDE_URL = "https://moneyrun.tech/guide"
-API_TIMEOUT = 8
+API_TIMEOUT = 60
+API_ATTEMPTS = 3
 FETCH_TIMEOUT = 8
 RETRY_SECONDS = 300
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
@@ -385,18 +386,26 @@ class RecommendationSource:
                 pass
 
     async def recommend(self, raw_text):
-        if len((raw_text + RECOMMENDATION_HEADER).encode("utf-16-le")) // 2 >= 4096:
+        available_units = 4096 - len((raw_text + RECOMMENDATION_HEADER).encode("utf-16-le")) // 2
+        if available_units <= 0:
             return None
         title, body = sanitize_ticket(raw_text, parse_ticket_event(raw_text))
         sources = self.knowledge.excerpts(title, body)
         if not sources:
             return None
-        try:
-            return await asyncio.wait_for(asyncio.to_thread(_complete, self.settings, title, body, sources),
-                                          timeout=API_TIMEOUT)
-        except (OSError, HTTPException, ValueError, LookupError, TypeError, AttributeError, RecursionError) as error:
-            LOG.warning("Не удалось подготовить рекомендацию ИИ (%s).", type(error).__name__)
-            return None
+        for attempt in range(1, API_ATTEMPTS + 1):
+            try:
+                answer = await asyncio.wait_for(asyncio.to_thread(
+                    _complete, self.settings, title, body, sources), timeout=API_TIMEOUT)
+            except (OSError, HTTPException, ValueError, LookupError, TypeError, AttributeError, RecursionError) as error:
+                reason = type(error).__name__
+            else:
+                if answer and len(answer.encode("utf-16-le")) // 2 <= available_units:
+                    return answer
+                reason = "пустой или слишком длинный ответ"
+            LOG.warning("Не удалось подготовить рекомендацию ИИ, попытка %d из %d (%s).",
+                        attempt, API_ATTEMPTS, reason)
+        return None
 
     async def probe(self):
         """Проверяет API синтетическим текстом без данных реального тикета."""

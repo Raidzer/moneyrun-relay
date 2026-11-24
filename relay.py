@@ -2,7 +2,7 @@
 
 import argparse
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from getpass import getpass
 from http.client import HTTPException
@@ -394,6 +394,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
     refresh_task = (asyncio.create_task(recommender.schedule_refresh(stop))
                     if recommender else None)
     last_send = 0.0
+    preparing_recommendation = False
 
     async def send(payload, *, reminder=False, regular=False, before_send=None, reaction=False):
         nonlocal last_send
@@ -470,6 +471,7 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 pass
 
     async def read_and_remind():
+        nonlocal preparing_recommendation
         while not stop.is_set():
             try:
                 messages = await client.get_messages(
@@ -499,7 +501,15 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
                 if store.process(message.id, event, created_at):
                     recommendation = None
                     if event and event["kind"] == "created" and recommender:
-                        recommendation = await recommender.recommend(message.raw_text or "")
+                        preparing_recommendation = True
+                        try:
+                            recommendation = await recommender.recommend(message.raw_text or "")
+                        except asyncio.CancelledError:
+                            # Telegram ещё не получил запрос, поэтому отправку можно повторить при запуске.
+                            store.resolve(message.id, "retry")
+                            raise
+                        finally:
+                            preparing_recommendation = False
                     payload = message_payload(message, config, recommendation)
                     if joke_source is not None:
                         payload["text"] = append_joke(payload["text"], await joke_source.choose())
@@ -561,9 +571,10 @@ async def run_tracking(client, source, config, store, stop, poll_interval, setti
             if task is not disconnected:
                 task.result()
         if stop.is_set():
-            if store.state["pending_id"] is None and not reader.done():
-                reader.cancel()  # Ожидание чтения можно прервать без изменения позиции.
-                await asyncio.gather(reader, return_exceptions=True)
+            if not reader.done() and (preparing_recommendation or store.state["pending_id"] is None):
+                reader.cancel()  # До обращения к Telegram можно остановиться без изменения позиции.
+                with suppress(asyncio.CancelledError):
+                    await reader
             else:
                 await reader  # Сохранить результат начатой отправки нового тикета.
         elif reader not in done:

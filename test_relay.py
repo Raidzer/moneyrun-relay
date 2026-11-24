@@ -375,6 +375,29 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         env_patch.start()
         self.addCleanup(env_patch.stop)
 
+    async def test_stop_during_recommendation_leaves_ticket_for_next_run(self):
+        folder = self.enterContext(TemporaryDirectory())
+        store = TicketStore(Path(folder) / "tickets.sqlite3", CONFIG, initial_id=100)
+        self.addCleanup(store.close)
+        client, stop = mock_client(), asyncio.Event()
+        client.get_messages.return_value = [message(CREATED)]
+
+        async def prepare(_):
+            self.assertEqual(store.state["pending_id"], 101)
+            stop.set()
+            await asyncio.Event().wait()
+
+        recommender = SimpleNamespace(schedule_refresh=lambda event: event.wait(), recommend=prepare)
+        with patch("relay.RecommendationSource.from_env", return_value=recommender), \
+                patch("relay.command_loop", side_effect=idle_commands), \
+                patch("relay.bot_call") as api, patch("builtins.print"):
+            await asyncio.wait_for(run_tracking(
+                client, object(), CONFIG, store, stop, 60, reminder_settings(), "dummy", BOT,
+            ), 1)
+        api.assert_not_awaited()
+        self.assertIsNone(store.state["pending_id"])
+        self.assertEqual(store.state["last_id"], 100)
+
     async def test_final_disconnect_stops_tracking_and_preserves_cursor(self):
         for error in (None, OSError("network unavailable")):
             with self.subTest(error=error), TemporaryDirectory() as folder:

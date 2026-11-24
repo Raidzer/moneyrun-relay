@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.error import HTTPError
 from zipfile import ZipFile
 
@@ -192,27 +192,42 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await self.recommender.recommend(TICKET + "🙂" * 2000))
         complete.assert_not_called()
 
-    async def test_http_error_and_malformed_response_do_not_expose_details(self):
+    async def test_http_error_and_malformed_response_fall_back_after_three_attempts(self):
         scenarios = (HTTPError(SETTINGS.base_url, 429, "test-secret", {}, None),
                      b'{"choices": []}', b'{"choices":[42]}', b'<html>error</html>')
         for scenario in scenarios:
             with self.subTest(scenario=type(scenario).__name__), \
                     patch.object(self.recommender.knowledge, "excerpts", return_value=["Пульс и XP"]), \
-                    patch.object(ai, "_read_response", side_effect=[scenario]), \
+                    patch.object(ai, "_read_response", side_effect=[scenario] * 3) as read, \
                     self.assertLogs("moneyrun_relay", level="WARNING") as log:
                 self.assertIsNone(await self.recommender.recommend(TICKET))
+            self.assertEqual(read.call_count, 3)
             self.assertNotIn("test-secret", "".join(log.output))
             self.assertNotIn("Иванов", "".join(log.output))
             self.assertIsNone(log.records[0].exc_info)
 
-    async def test_api_await_has_timeout(self):
+    async def test_retries_unusable_answers_and_stops_when_an_answer_fits(self):
+        answer = "Сверить расчёт XP."
+        for failures in ([None], [None, "🙂" * 40]):
+            remaining = 4096 - len(ai.RECOMMENDATION_HEADER.encode("utf-16-le")) // 2 - 50
+            raw_text = TICKET + "a" * (remaining - len(TICKET.encode("utf-16-le")) // 2)
+            with self.subTest(failures=len(failures)), \
+                    patch.object(self.recommender.knowledge, "excerpts", return_value=["Пульс и XP"]), \
+                    patch.object(ai, "_complete", side_effect=[*failures, answer]) as complete, \
+                    self.assertLogs("moneyrun_relay", level="WARNING"):
+                self.assertEqual(await self.recommender.recommend(raw_text), answer)
+            self.assertEqual(complete.call_count, len(failures) + 1)
+
+    async def test_api_timeout_applies_to_each_attempt(self):
         async def blocked(*args):
             await asyncio.Event().wait()
 
-        with patch.object(ai, "API_TIMEOUT", 0.01), patch.object(ai.asyncio, "to_thread", blocked), \
+        worker = AsyncMock(side_effect=blocked)
+        with patch.object(ai, "API_TIMEOUT", 0.01), patch.object(ai.asyncio, "to_thread", worker), \
                 patch.object(self.recommender.knowledge, "excerpts", return_value=["Пульс и XP"]), \
                 self.assertLogs("moneyrun_relay", level="WARNING"):
             self.assertIsNone(await self.recommender.recommend(TICKET))
+        self.assertEqual(worker.await_count, 3)
 
 
 if __name__ == "__main__":
