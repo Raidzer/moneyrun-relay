@@ -152,10 +152,10 @@ class SourceTests(unittest.TestCase):
 
     def test_google_document_text_is_split_into_labeled_excerpts(self):
         documents = list(ai._clarifications_documents(
-            "Проверить IQ и eTRIMP.\n\nПривести дословную цитату из правила.".encode()))
+            "IQ.".encode()))
         self.assertEqual(len(documents), 1)
         self.assertTrue(documents[0].startswith(ai.CLARIFICATIONS_LABEL + "\n"))
-        self.assertIn("дословную цитату", documents[0])
+        self.assertIn("IQ.", documents[0])
 
 
 class CacheTests(unittest.IsolatedAsyncioTestCase):

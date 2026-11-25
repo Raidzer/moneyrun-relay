@@ -326,7 +326,7 @@ def _guide_documents(body):
 
 def _clarifications_documents(body):
     text = _clean(body.decode("utf-8-sig"))
-    if len(text) < 20:
+    if not text:
         raise ValueError("Документ с уточнениями не содержит текста.")
     return (CLARIFICATIONS_LABEL + "\n" + excerpt
             for excerpt in textwrap.wrap(
@@ -420,8 +420,9 @@ class KnowledgeCache:
                         if isinstance(value, Exception)]
             if failures:
                 for label, error in failures:
+                    detail = str(error) if isinstance(error, ValueError) else type(error).__name__
                     LOG.warning("Не удалось обновить %s (%s). Сохранена прежняя копия.",
-                                label, type(error).__name__)
+                                label, detail)
                 return
             clarifications = fetched[2] if len(fetched) == 3 else []
             if self.clarifications_url:
