@@ -21,6 +21,8 @@ TICKET = ("#KhromushkinTeam\n\nПользователь Иван Иванов с
           "ИВАН, проверьте XP у Иванова? Иванов, вот #123456 и https://t.me/Иван, "
           "athlete@example.com, @athlete и +7 (912) 345-67-89. Пульс 175.")
 SETTINGS = ai.AiSettings("https://api.example.test/v1", "test-secret", "test-model")
+RULE_QUOTE = "Полученное значение XP умножается на текущий RQ, а затем на IQ (Intensive Quotient)."
+GUIDE_EXCERPT = f"{ai.GUIDE_LABEL}\n{RULE_QUOTE}"
 
 
 class SettingsTests(unittest.TestCase):
@@ -42,18 +44,45 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "^AI_API_BASE_URL"):
                     ai.ai_settings()
 
+    def test_google_document_link_is_converted_to_text_export(self):
+        env = {"AI_RECOMMENDATIONS_ENABLED": "true", "AI_API_BASE_URL": SETTINGS.base_url,
+               "AI_API_KEY": SETTINGS.api_key, "AI_MODEL": SETTINGS.model,
+               "AI_CLARIFICATIONS_URL": "https://docs.google.com/document/d/abc_123/edit"}
+        with patch.dict(os.environ, env, clear=True):
+            settings = ai.ai_settings()
+        self.assertEqual(settings.clarifications_url,
+                         "https://docs.google.com/document/d/abc_123/export?format=txt")
 
-class PromptTests(unittest.TestCase):
-    def test_only_sanitized_topic_and_body_in_user_message(self):
+    def test_invalid_clarifications_link_is_rejected(self):
+        env = {"AI_RECOMMENDATIONS_ENABLED": "true", "AI_API_BASE_URL": SETTINGS.base_url,
+               "AI_API_KEY": SETTINGS.api_key, "AI_MODEL": SETTINGS.model,
+               "AI_CLARIFICATIONS_URL": "https://example.test/private.txt"}
+        with patch.dict(os.environ, env, clear=True), \
+                self.assertRaisesRegex(ValueError, "AI_CLARIFICATIONS_URL"):
+            ai.ai_settings()
+
+
+class PromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sanitized_request_and_exact_quote_in_the_card(self):
         event = parse_ticket_event(TICKET)
         topic, body = ai.sanitize_ticket(TICKET, event)
         self.assertEqual(topic, "XP")
         self.assertIn("Пульс 175.", body)
         self.assertIn("[скрыто]", body)
-        response = {"choices": [{"message": {"content": "Сверить расчёт XP."}}]}
-        with patch.object(ai, "_read_response", return_value=json.dumps(response).encode()) as read:
-            self.assertEqual(ai._complete(SETTINGS, topic, body, ["Официальный гайд Moneyrun"]),
-                             "Сверить расчёт XP.")
+        response = {"choices": [{"message": {"content": json.dumps({
+            "source": 1,
+            "quote": RULE_QUOTE,
+            "analysis": "Сверить данные расчёта.",
+            "checks": ["Открыть расчёт XP."],
+            "reply": "Понадобятся данные тренировки.",
+        }, ensure_ascii=False)}}]}
+        directory = self.enterContext(TemporaryDirectory())
+        recommender = ai.RecommendationSource(SETTINGS, directory)
+        with patch.object(recommender.knowledge, "excerpts", return_value=[GUIDE_EXCERPT]), \
+                patch.object(ai, "_read_response", return_value=json.dumps(response).encode()) as read:
+            answer = await recommender.recommend(TICKET)
+        self.assertTrue(answer.startswith(f"Цитата из правила\n«{RULE_QUOTE}»\n{ai.GUIDE_LABEL}\n{ai.GUIDE_URL}"))
+        self.assertIn("1. Открыть расчёт XP.", answer)
         request = read.call_args.args[0]
         self.assertEqual(request.full_url, SETTINGS.base_url + "/chat/completions")
         self.assertEqual(request.get_header("Authorization"), "Bearer " + SETTINGS.api_key)
@@ -62,9 +91,17 @@ class PromptTests(unittest.TestCase):
         prompt_text = payload["messages"][1]["content"]
         prompt = json.loads(prompt_text)
         self.assertEqual(prompt["тема"], "XP")
+        self.assertEqual(prompt["справочные выдержки"], {"1": GUIDE_EXCERPT})
         for secret in ("KhromushkinTeam", "создал новый тикет", "ИВАН", "Иванов", "123456", "https://t.me/",
                        "athlete@example.com", "@athlete", "345-67-89", SETTINGS.api_key):
             self.assertNotIn(secret, prompt_text)
+
+    def test_changed_quote_or_wrong_source_is_rejected(self):
+        result = {"source": 1, "quote": RULE_QUOTE, "analysis": "Сверить расчёт.", "checks": [], "reply": ""}
+        sources = [GUIDE_EXCERPT, "Таблица «MR Забота»\nСверить пульс."]
+        for invalid in ({"quote": RULE_QUOTE.replace("умножается", "делится")}, {"source": 2}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "Цитата не совпадает"):
+                ai._format_recommendation(json.dumps({**result, **invalid}), sources)
 
     def test_ticket_is_limited_and_control_characters_are_removed(self):
         long_ticket = TICKET + "\u202e\x00" + "а" * (ai.MAX_TICKET_CHARS + 100)
@@ -113,6 +150,13 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("Заголовок страницы", document)
         self.assertIn("& учитывается", document)
 
+    def test_google_document_text_is_split_into_labeled_excerpts(self):
+        documents = list(ai._clarifications_documents(
+            "Проверить IQ и eTRIMP.\n\nПривести дословную цитату из правила.".encode()))
+        self.assertEqual(len(documents), 1)
+        self.assertTrue(documents[0].startswith(ai.CLARIFICATIONS_LABEL + "\n"))
+        self.assertIn("дословную цитату", documents[0])
+
 
 class CacheTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -124,6 +168,22 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         clock_patch = patch.object(ai, "time", self.clock)
         clock_patch.start()
         self.addCleanup(clock_patch.stop)
+
+    def test_cyrillic_xp_and_average_heart_rate_find_the_calculation_rule(self):
+        cache = ai.KnowledgeCache(self.path)
+        cache._snapshot = {
+            "sheet": ["Таблица «MR Забота»\nГде посмотреть средний темп за тренировку?"],
+            "guide": [
+                f"{ai.GUIDE_LABEL}\nНа забегах 5 км учитывается время финиша.",
+                f"{ai.GUIDE_LABEL}\nУчитывайте средний темп за тренировку и дистанцию в км.",
+                f"{ai.GUIDE_LABEL}\nУсловия для повышения грейда зависят от XP.",
+                GUIDE_EXCERPT,
+            ],
+        }
+        excerpts = cache.excerpts("Другая проблема",
+                                  "Почему за тренировку 0 хр? 5,63 км за 31:50, средний чсс 125.")
+        guide_excerpts = [excerpt for excerpt in excerpts if excerpt.startswith(ai.GUIDE_LABEL)]
+        self.assertEqual(guide_excerpts[0], GUIDE_EXCERPT)
 
     async def test_refresh_at_03_moscow_and_use_last_good_on_partial_failure(self):
         cache = ai.KnowledgeCache(self.path)
@@ -174,6 +234,22 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
             await cache.refresh()
         self.assertEqual(cache.excerpts("XP", "Пульс"), [])
 
+    async def test_optional_clarifications_source_is_cached(self):
+        cache = ai.KnowledgeCache(self.path, "https://docs.google.com/document/d/id/export?format=txt")
+        documents = {
+            ai.SHEET_URL: ["Таблица MR Забота"],
+            ai.GUIDE_URL: ["Официальный гайд"],
+            "https://docs.google.com/document/d/id/export?format=txt": ["Уточнение поддержки"],
+        }
+
+        def fetch(url, _):
+            return documents[url]
+
+        with patch.object(ai, "_fetch_documents", side_effect=fetch) as mocked:
+            await cache.refresh()
+        self.assertEqual(mocked.call_count, 3)
+        self.assertEqual(cache._snapshot["clarifications"], ["Уточнение поддержки"])
+
 
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -207,15 +283,19 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(log.records[0].exc_info)
 
     async def test_retries_unusable_answers_and_stops_when_an_answer_fits(self):
-        answer = "Сверить расчёт XP."
-        for failures in ([None], [None, "🙂" * 40]):
-            remaining = 4096 - len(ai.RECOMMENDATION_HEADER.encode("utf-16-le")) // 2 - 50
-            raw_text = TICKET + "a" * (remaining - len(TICKET.encode("utf-16-le")) // 2)
+        result = {"source": None, "quote": "", "analysis": "Сверить расчёт XP.", "checks": [], "reply": ""}
+        answer = json.dumps(result)
+        long_answer = json.dumps({**result, "analysis": "🙂" * 120})
+        remaining = 4096 - len(ai.RECOMMENDATION_HEADER.encode("utf-16-le")) // 2 - 180
+        raw_text = TICKET + "a" * (remaining - len(TICKET.encode("utf-16-le")) // 2)
+        for failures in ([None], [None, long_answer]):
             with self.subTest(failures=len(failures)), \
                     patch.object(self.recommender.knowledge, "excerpts", return_value=["Пульс и XP"]), \
                     patch.object(ai, "_complete", side_effect=[*failures, answer]) as complete, \
                     self.assertLogs("moneyrun_relay", level="WARNING"):
-                self.assertEqual(await self.recommender.recommend(raw_text), answer)
+                formatted = await self.recommender.recommend(raw_text)
+                self.assertIn("В найденных выдержках нет подходящей дословной цитаты.", formatted)
+                self.assertIn("Сверить расчёт XP.", formatted)
             self.assertEqual(complete.call_count, len(failures) + 1)
 
     async def test_api_timeout_applies_to_each_attempt(self):
