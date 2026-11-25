@@ -409,10 +409,20 @@ class KnowledgeCache:
                 asyncio.to_thread(_fetch_documents, SHEET_URL, _sheet_documents),
                 asyncio.to_thread(_fetch_documents, GUIDE_URL, _guide_documents),
             ]
+            labels = ["таблицу MR Забота", "официальный гайд"]
             if self.clarifications_url:
                 tasks.append(asyncio.to_thread(_fetch_documents, self.clarifications_url,
                                                _clarifications_documents))
-            fetched = await asyncio.wait_for(asyncio.gather(*tasks), timeout=FETCH_TIMEOUT)
+                labels.append("Google Документ с уточнениями")
+            fetched = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=FETCH_TIMEOUT)
+            failures = [(label, value) for label, value in zip(labels, fetched)
+                        if isinstance(value, Exception)]
+            if failures:
+                for label, error in failures:
+                    LOG.warning("Не удалось обновить %s (%s). Сохранена прежняя копия.",
+                                label, type(error).__name__)
+                return
             clarifications = fetched[2] if len(fetched) == 3 else []
             if self.clarifications_url:
                 clarifications = [
